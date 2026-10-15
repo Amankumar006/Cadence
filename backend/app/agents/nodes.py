@@ -3,7 +3,7 @@ import asyncio
 import datetime
 import json
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List
 from langgraph.store.base import BaseStore
 from langchain_core.runnables import RunnableConfig
 from app.agents.llm import PLANNER, ROUTER, atext, astructured, bypass_llm
@@ -16,12 +16,17 @@ from app.agents.state import AgentState
 from app.config import settings
 from app.memory.store import save_user_profile, sync_and_load_user_profile
 from app.tools.memory import store_preference_func
-from app.tools.timetable import fetch_timetable_func
 from app.tools.calendar import write_calendar_func
 from app.tools.notifications import schedule_push_func, send_immediate_push
 from app.tools.tmdb import search_movies_func
 from app.agents.discovery import identify_missing_slots
+from app.context import load_chat_context, load_schedule_context
 from app.agents.parser import parse_due_date, parse_user_info
+from app.agents.scheduler import (
+    problem_from_context,
+    solve,
+    verify_candidate,
+)
 from app.agents.prompts import (
     CHAT_INSTRUCTIONS,
     CLASSIFY_INSTRUCTIONS,
@@ -429,129 +434,28 @@ async def hydrate_context(state: AgentState, store: BaseStore) -> Dict[str, Any]
         except Exception as parse_err:
             logger.warning(f"Failed parsing inline user message: {parse_err}")
 
-    # 2. Fetch timetable, academic events, personal schedule, calendar, and notes in parallel
-    db = firestore_async.client()
-    
-    timetable_task = fetch_timetable_func(user_id=user_id, date=date)
-    tasks_task = db.collection("tasks").document(user_id).collection("items").get()
-    events_task = db.collection("academic_events").document(user_id).collection("items").get()
-    personal_task = db.collection("personal_schedule").document(user_id).get()
-    calendar_task = db.collection("academic_calendar").document(user_id).get()
-    notes_task = db.collection("notes").document(user_id).collection("items").get()
-    
-    timetable_res, tasks_snap, events_snap, personal_doc, calendar_doc, notes_snap = await asyncio.gather(
-        timetable_task,
-        tasks_task,
-        events_task,
-        personal_task,
-        calendar_task,
-        notes_task
-    )
-    
-    # Process tasks
-    tasks = []
-    for doc in tasks_snap:
-        tdata = doc.to_dict()
-        if not tdata.get("completed", False):
-            tdata["id"] = doc.id
-            tasks.append(tdata)
-            
-    classes = timetable_res.get("classes") or []
-    weekday = timetable_res.get("weekday", "")
-    timetable_today = {"classes": classes, "weekday": weekday}
-    
-    # Filter academic events: due within 14 days and completed=false, sorted by due_date
-    academic_events = []
-    dt_today = datetime.date.fromisoformat(date)
-    for doc in events_snap:
-        event_data = doc.to_dict()
-        event_data["id"] = doc.id
-        if not event_data.get("completed", False):
-            due_date_str = event_data.get("due_date")
-            if due_date_str:
-                try:
-                    dt_due = datetime.date.fromisoformat(due_date_str)
-                    days_remaining = (dt_due - dt_today).days
-                    if 0 <= days_remaining <= 14:
-                        event_data["days_remaining"] = days_remaining
-                        academic_events.append(event_data)
-                except ValueError:
-                    pass
-    academic_events.sort(key=lambda x: x.get("due_date", "9999-12-31"))
-    
-    # Personal fixed blocks
-    personal_fixed_blocks = (personal_doc.to_dict() or {}).get("fixed_blocks", []) if personal_doc.exists else []
-    
-    # Academic calendar
-    academic_calendar = calendar_doc.to_dict() or {} if calendar_doc.exists else {}
-
-    # Fetch syllabus status in parallel for subjects with upcoming events
-    syllabus_status = {}
-    subjects_due_soon = set()
-    for event in academic_events:
-        sub = event.get("subject")
-        if sub and sub.lower() != "all":
-            subjects_due_soon.add(sub)
-                
-    async def fetch_subject_syllabus(subj):
-        try:
-            doc = await db.collection("syllabus").document(user_id).collection("subjects").document(subj).get()
-            if doc.exists:
-                return subj, doc.to_dict()
-        except Exception as e:
-            logger.error(f"Error fetching syllabus for {subj}: {e}")
-        return subj, None
-
-    if subjects_due_soon:
-        syllabus_results = await asyncio.gather(*(fetch_subject_syllabus(s) for s in subjects_due_soon))
-        for subj, syl_data in syllabus_results:
-            if syl_data:
-                syllabus_status[subj] = syl_data
+    # 2. Everything the solver needs, via the typed loaders in app.context.
+    #    Those own the filtering rules (14-day event horizon, 7-day note
+    #    freshness, syllabus only for subjects with something due) so the same
+    #    rules are not re-derived in general_chat and save_user_info_node.
+    ctx = await load_schedule_context(user_id, date)
 
     college_info = state.get("college_info")
     if college_info is None:
         college_info = user_profile.get("college_info") or {}
-        
+
     calendar_status = state.get("calendar_status")
     if calendar_status is None:
         calendar_status = user_profile.get("calendar_status") or "unknown"
-        
-    # Process recent notes (last 7 days)
-    recent_notes = []
-    dt_today = datetime.date.fromisoformat(date)
-    dt_7_days_ago = dt_today - datetime.timedelta(days=7)
-    for doc in notes_snap:
-        ndata = doc.to_dict()
-        ndata["id"] = doc.id
-        created_at_str = ndata.get("created_at")
-        is_recent = True
-        if created_at_str:
-            try:
-                dt_created = datetime.datetime.fromisoformat(created_at_str.replace("Z", "+00:00")).date()
-                if dt_created < dt_7_days_ago:
-                    is_recent = False
-            except Exception:
-                pass
-        if is_recent:
-            if "type" not in ndata:
-                ndata["type"] = "text"
-            recent_notes.append(ndata)
 
     # Bypassed guided discovery loop in hydrate_context (handled in check_clarification_node)
     return {
         "user_profile": user_profile,
-        "timetable_today": timetable_today,
-        "task_queue": tasks,
-        "pending_tasks": tasks,
-        "recent_notes": recent_notes,
-        "academic_events": academic_events,
-        "personal_fixed_blocks": personal_fixed_blocks,
-        "syllabus_status": syllabus_status,
+        **ctx,
         "needs_clarification": False,
         "clarification_question": None,
         "college_info": college_info,
         "calendar_status": calendar_status,
-        "academic_calendar": academic_calendar
     }
 
 async def ask_clarification(state: AgentState, store: BaseStore) -> Dict[str, Any]:
@@ -562,6 +466,33 @@ async def ask_clarification(state: AgentState, store: BaseStore) -> Dict[str, An
         "messages": [{"role": "assistant", "content": question}],
         "needs_clarification": False  # Reset flag once asked
     }
+
+def merge_solver_and_model_blocks(solved_blocks, model_blocks):
+    """Overlay the model's notes onto the solver's placement.
+
+    The solver owns *when* things happen; the model owns *what to say* about
+    them. Taking the model's times would reintroduce the overlap bug this whole
+    module exists to remove, so times are matched by title and the solver's are
+    always kept. Blocks the model did not mention keep their solver notes.
+    """
+    notes_by_title = {}
+    for block in model_blocks or []:
+        title = getattr(block, "title", None) or (block.get("title") if isinstance(block, dict) else None)
+        notes = getattr(block, "notes", None)
+        if notes is None and isinstance(block, dict):
+            notes = block.get("notes")
+        if title and notes:
+            notes_by_title[str(title)] = str(notes)
+
+    merged = []
+    for block in solved_blocks:
+        new_block = dict(block)
+        model_notes = notes_by_title.get(str(block.get("title", "")))
+        if model_notes:
+            new_block["notes"] = model_notes
+        merged.append(new_block)
+    return merged
+
 
 def generate_rule_based_schedule(
     user_id: str,
@@ -886,6 +817,7 @@ async def build_schedule(state: AgentState) -> Dict[str, Any]:
  
     # ── Saturday Movie Night TMDB Recommendation ──
     movie_info_str = ""
+    movie_info = None
     if weekday_name.lower() == "saturday":
         try:
             logger.info("Today is Saturday. Fetching TMDB recommendation for schedule block...")
@@ -904,6 +836,11 @@ async def build_schedule(state: AgentState) -> Dict[str, Any]:
                 movie_title = top_movie.get("title", "Curated Movie")
                 movie_rating = top_movie.get("rating", "7.0")
                 movie_overview = top_movie.get("overview", "A special movie pick for you.")
+                movie_info = {
+                    "title": movie_title,
+                    "rating": movie_rating,
+                    "overview": movie_overview,
+                }
                 movie_info_str = f"\n🎥 SATURDAY MOVIE NIGHT MANDATE:\nYou MUST schedule a movie block at exactly 21:30 titled 'Movie Night: {movie_title}' (type: ent, duration: 120 min) with notes: '⭐ {movie_rating}/10 - {movie_overview[:120]}...'"
                 logger.info(f"Top Saturday movie found: {movie_title}")
             else:
@@ -1000,11 +937,30 @@ Next holiday: {next_holiday}""",
 
     logger.info("Generated schedule prompt for date: %s", date)
 
-    proposed_schedule = None
+    # 3. Extract the scheduling problem, then solve it with CP-SAT.
+    #
+    # The split matters. Deciding *what* needs placing and with what constraints
+    # is an extraction job the LLM is good at; placing it without overlaps is
+    # constraint satisfaction, which LLMs are measurably bad at and which the
+    # old rule-based builder got wrong outright (it emitted a hardcoded 15:00
+    # block per critical CIE, so two exams inside three days collided).
+    problem = problem_from_context(
+        date=date,
+        weekday_name=weekday_name,
+        is_weekend=is_weekend,
+        classes=classes,
+        personal_fixed_blocks=personal_fixed_blocks,
+        academic_events=academic_events,
+        academic_calendar=academic_calendar,
+        user_profile=user_profile,
+        pending_tasks=pending_tasks,
+        recent_notes=recent_notes,
+        movie_info=movie_info,
+    )
 
-    # 1. Bypass LLM for test users to avoid API rate limit depletion during automated runs
-    if bypass_llm(user_id):
-        logger.info("Bypassing LLM call for test user: %s", user_id)
+    result = solve(problem)
+    if not result.ok:
+        logger.error("CP-SAT could not solve the schedule (%s); using fallback", result.status)
         proposed_schedule = generate_rule_based_schedule(
             user_id=user_id,
             date=date,
@@ -1016,38 +972,67 @@ Next holiday: {next_holiday}""",
             academic_calendar=academic_calendar,
             user_profile=user_profile,
             pending_tasks=pending_tasks,
-            recent_notes=recent_notes
+            recent_notes=recent_notes,
         )
-    else:
-        # Schema-constrained call: the model cannot emit malformed JSON, and
-        # every block is validated (time/title/duration/type) before use.
-        log_prompt_shape("schedule", prompt, settings.PRIMARY_MODEL)
-        proposal = await astructured(
-            prompt, ScheduleProposal, user_id=user_id, tier=PLANNER, label="schedule"
-        )
+        return {"proposed_schedule": proposed_schedule, "needs_clarification": False}
 
-        if proposal is None or not proposal.blocks:
-            logger.error(
-                "All LLM models failed or returned no blocks. Building rule-based fallback."
-            )
-            proposed_schedule = generate_rule_based_schedule(
+    proposed_schedule = result.blocks
+
+    # 4. Verify independently of the solver, then let the LLM annotate.
+    #
+    # verify_candidate re-derives every hard constraint from the problem rather
+    # than trusting the solver, so a solver bug cannot mark its own homework. A
+    # failure here means we do NOT show the user the schedule.
+    violations = verify_candidate(proposed_schedule, problem)
+    if violations:
+        logger.error(
+            "Solved schedule failed verification (%d violations: %s); using fallback",
+            len(violations),
+            "; ".join(v.code for v in violations[:5]),
+        )
+        proposed_schedule = generate_rule_based_schedule(
+            user_id=user_id,
+            date=date,
+            weekday_name=weekday_name,
+            is_weekend=is_weekend,
+            classes=classes,
+            personal_fixed_blocks=personal_fixed_blocks,
+            academic_events=academic_events,
+            academic_calendar=academic_calendar,
+            user_profile=user_profile,
+            pending_tasks=pending_tasks,
+            recent_notes=recent_notes,
+        )
+        return {"proposed_schedule": proposed_schedule, "needs_clarification": False}
+
+    logger.info(
+        "Solved schedule for %s: %d blocks in %.3fs (%s), dropped %s",
+        date,
+        len(proposed_schedule),
+        result.solver_time_s,
+        result.status,
+        result.dropped or "nothing",
+    )
+
+    # 5. The LLM's remaining job is to write the notes for each block — a
+    # writing task, not a planning one. If it fails, the solved schedule stands
+    # on its own with the notes the solver already attached.
+    if not bypass_llm(user_id):
+        try:
+            log_prompt_shape("schedule", prompt, settings.PRIMARY_MODEL)
+            annotated = await astructured(
+                prompt,
+                ScheduleProposal,
                 user_id=user_id,
-                date=date,
-                weekday_name=weekday_name,
-                is_weekend=is_weekend,
-                classes=classes,
-                personal_fixed_blocks=personal_fixed_blocks,
-                academic_events=academic_events,
-                academic_calendar=academic_calendar,
-                user_profile=user_profile,
-                pending_tasks=pending_tasks,
-                recent_notes=recent_notes
+                tier=PLANNER,
+                label="schedule_notes",
             )
-        else:
-            proposed_schedule = [block.model_dump() for block in proposal.blocks]
-            logger.info(
-                "Successfully parsed proposed schedule with %d blocks.", len(proposed_schedule)
-            )
+            if annotated is not None and annotated.blocks:
+                proposed_schedule = merge_solver_and_model_blocks(
+                    proposed_schedule, annotated.blocks
+                )
+        except Exception as annotate_err:
+            logger.warning("LLM annotation failed; keeping solver output: %s", annotate_err)
 
     return {
         "proposed_schedule": proposed_schedule,
@@ -1104,31 +1089,23 @@ async def general_chat(state: AgentState, store: BaseStore) -> Dict[str, Any]:
     user_id = state.get("user_id", "default_user")
     date = state.get("intent_date") or datetime.date.today().isoformat()
     
-    # Load user profile, timetable, and pending tasks in parallel
-    user_profile = {}
-    classes = []
+    # Chat answers questions about today, so it needs today's classes, the
+    # events and the task list. The full schedule context also loads the
+    # academic calendar, recent notes and a syllabus read per due subject --
+    # four extra round trips to answer "what's on today?".
+    user_profile: Dict[str, Any] = {}
+    classes: List[Dict[str, Any]] = []
     weekday = "today"
-    academic_events = []
-    tasks = []
-    
+    academic_events: List[Dict[str, Any]] = []
+    tasks: List[Dict[str, Any]] = []
+
     try:
+        chat_ctx = await load_chat_context(user_id, date)
         user_profile = await sync_and_load_user_profile(store, user_id)
-        db = firestore_async.client()
-        
-        schedule_info, task_queue = await asyncio.gather(
-            fetch_timetable_func(user_id=user_id, date=date),
-            db.collection("tasks").document(user_id).collection("items").get()
-        )
-        
-        classes = schedule_info.get("classes") or []
-        weekday = schedule_info.get("weekday", "today")
-        academic_events = schedule_info.get("academic_events") or []
-        
-        for doc in task_queue:
-            tdata = doc.to_dict()
-            if not tdata.get("completed", False):
-                tdata["id"] = doc.id
-                tasks.append(tdata)
+        classes = chat_ctx["timetable_today"]["classes"]
+        weekday = chat_ctx["timetable_today"]["weekday"] or "today"
+        academic_events = chat_ctx["academic_events"]
+        tasks = chat_ctx["task_queue"]
     except Exception as gather_err:
         logger.warning(f"general_chat failed to gather database context: {gather_err}")
 

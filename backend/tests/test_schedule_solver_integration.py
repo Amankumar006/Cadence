@@ -214,3 +214,95 @@ async def test_an_empty_context_still_yields_a_sleep_block(solver_fake_llm):
     }
     blocks = await _run_build(state)
     assert [b["title"] for b in blocks] == ["Sleep"]
+
+
+# ── The degraded path ───────────────────────────────────────────────────────
+
+
+async def test_a_solver_failure_falls_back_rather_than_raising(solver_fake_llm, monkeypatch):
+    """A schedule we cannot defend must degrade to something, not to an error."""
+    import app.agents.nodes as nodes_mod
+
+    # solve() is synchronous -- CP-SAT runs in-process, not on an event loop.
+    def _boom(problem):
+        class _R:
+            ok = False
+            status = "INFEASIBLE"
+            blocks = []
+            dropped = []
+            solver_time_s = 0.0
+
+        return _R()
+
+    monkeypatch.setattr(nodes_mod, "solve", _boom)
+    blocks = await _run_build(BUSY_STATE)
+    # The fallback is the old rule-based builder, which always emits Sleep.
+    assert any(b["title"] == "Sleep" for b in blocks)
+
+
+async def test_a_verification_failure_falls_back_rather_than_showing_bad_data(
+    solver_fake_llm, monkeypatch
+):
+    """If the solver returns something verify_candidate rejects, we must not show it."""
+    import app.agents.nodes as nodes_mod
+    import app.agents.scheduler as sched
+
+    real_verify = sched.verify_candidate
+    from app.agents.scheduler import Violation
+
+    monkeypatch.setattr(nodes_mod, "verify_candidate", lambda *a, **kw: [Violation("BAD", "x")])
+    assert real_verify is not None
+
+    blocks = await _run_build(BUSY_STATE)
+    assert any(b["title"] == "Sleep" for b in blocks)
+
+
+async def test_the_happy_path_is_not_accidentally_a_fallback(solver_fake_llm, monkeypatch):
+    """Guard against the fallback silently becoming the normal path.
+
+    If this ever fails, every schedule the app produces is the old
+    overlapping-blocks builder and the solver is doing nothing.
+    """
+    import app.agents.nodes as nodes_mod
+    import app.agents.scheduler as sched
+
+    seen = {}
+    real_solve = sched.solve
+
+    def _spy(problem):
+        result = real_solve(problem)
+        seen["status"] = result.status
+        seen["ok"] = result.ok
+        seen["n"] = len(result.blocks)
+        return result
+
+    monkeypatch.setattr(nodes_mod, "solve", _spy)
+    blocks = await _run_build(BUSY_STATE)
+
+    assert seen.get("ok") is True, f"solver did not succeed: {seen.get('status')}"
+    assert seen["n"] >= 4, f"solver placed only {seen['n']} blocks"
+    assert len(blocks) == seen["n"], "the fallback must not have run"
+
+
+async def test_the_fallback_helper_returns_the_shape_the_node_promises():
+    """_fallback_schedule reads its args from the caller's locals."""
+    import app.agents.nodes as nodes_mod
+
+    out = nodes_mod._fallback_schedule(
+        {
+            "user_id": "u1",
+            "date": "2026-10-15",
+            "weekday_name": "Thursday",
+            "is_weekend": False,
+            "classes": [],
+            "personal_fixed_blocks": [],
+            "academic_events": [],
+            "academic_calendar": {},
+            "user_profile": {"wake_time": "07:00", "sleep_target": "23:00"},
+            "pending_tasks": [],
+            "recent_notes": [],
+        }
+    )
+    assert out["needs_clarification"] is False
+    assert isinstance(out["proposed_schedule"], list)
+    assert any(b["title"] == "Sleep" for b in out["proposed_schedule"])

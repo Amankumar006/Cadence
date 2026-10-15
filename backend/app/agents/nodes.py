@@ -645,6 +645,36 @@ def generate_rule_based_schedule(
     
     return blocks
 
+def _fallback_schedule(scope: Dict[str, Any]) -> Dict[str, Any]:
+    """Last-resort schedule when CP-SAT cannot solve or verification fails.
+
+    Both the solve-failure and the verify-failure branch used to repeat this
+    call verbatim, so adding a field meant editing two blocks. ``locals()`` of
+    the caller is passed rather than twelve named arguments.
+
+    This is the path that produced the overlapping-blocks bug: it hardcodes
+    times and never checks for conflicts. It exists so a solver failure is a
+    degraded day rather than an error page, which is why every branch here logs
+    at error level first.
+    """
+    return {
+        "proposed_schedule": generate_rule_based_schedule(
+            user_id=scope["user_id"],
+            date=scope["date"],
+            weekday_name=scope["weekday_name"],
+            is_weekend=scope["is_weekend"],
+            classes=scope["classes"],
+            personal_fixed_blocks=scope["personal_fixed_blocks"],
+            academic_events=scope["academic_events"],
+            academic_calendar=scope["academic_calendar"],
+            user_profile=scope["user_profile"],
+            pending_tasks=scope["pending_tasks"],
+            recent_notes=scope["recent_notes"],
+        ),
+        "needs_clarification": False,
+    }
+
+
 async def build_schedule(state: AgentState) -> Dict[str, Any]:
     """Generates the proposed schedule based on timetable, profile, and tasks."""
     logger.info("Node: build_schedule")
@@ -960,21 +990,10 @@ Next holiday: {next_holiday}""",
 
     result = solve(problem)
     if not result.ok:
-        logger.error("CP-SAT could not solve the schedule (%s); using fallback", result.status)
-        proposed_schedule = generate_rule_based_schedule(
-            user_id=user_id,
-            date=date,
-            weekday_name=weekday_name,
-            is_weekend=is_weekend,
-            classes=classes,
-            personal_fixed_blocks=personal_fixed_blocks,
-            academic_events=academic_events,
-            academic_calendar=academic_calendar,
-            user_profile=user_profile,
-            pending_tasks=pending_tasks,
-            recent_notes=recent_notes,
+        logger.error(
+            "CP-SAT could not solve the schedule (%s); using fallback", result.status
         )
-        return {"proposed_schedule": proposed_schedule, "needs_clarification": False}
+        return _fallback_schedule(locals())
 
     proposed_schedule = result.blocks
 
@@ -990,20 +1009,7 @@ Next holiday: {next_holiday}""",
             len(violations),
             "; ".join(v.code for v in violations[:5]),
         )
-        proposed_schedule = generate_rule_based_schedule(
-            user_id=user_id,
-            date=date,
-            weekday_name=weekday_name,
-            is_weekend=is_weekend,
-            classes=classes,
-            personal_fixed_blocks=personal_fixed_blocks,
-            academic_events=academic_events,
-            academic_calendar=academic_calendar,
-            user_profile=user_profile,
-            pending_tasks=pending_tasks,
-            recent_notes=recent_notes,
-        )
-        return {"proposed_schedule": proposed_schedule, "needs_clarification": False}
+        return _fallback_schedule(locals())
 
     logger.info(
         "Solved schedule for %s: %d blocks in %.3fs (%s), dropped %s",

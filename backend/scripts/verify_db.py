@@ -30,12 +30,63 @@ def check(name, ok, detail=""):
     return ok
 
 
+def _failure_hint(detail: str) -> str:
+    """Turn a driver error into the one thing to actually check.
+
+    "Connection refused" and "connection reset by peer" mean completely
+    different things, and the generic message sent people looking for a
+    suspended endpoint when the real problem was a firewall.
+    """
+    low = detail.lower()
+    if (
+        "reset by peer" in low
+        or "eof" in low
+        or "ssl" in low
+        or "tls" in low
+        # libpq's wording when the TLS handshake is killed rather than refused.
+        or "server closed the connection unexpectedly" in low
+    ):
+        return (
+            "\n  TCP connected (an IPv4 address was tried after the default route"
+            "\n  failed) but the TLS handshake was killed. That is a network"
+            "\n  filter, not a credential: the port is reachable but encrypted"
+            "\n  traffic to it is being reset. Check any proxy, VPN or egress"
+            "\n  allowlist between here and Neon."
+        )
+    if "network is unreachable" in low:
+        return (
+            "\n  No route to the database host. If it resolves only to IPv6 and"
+            "\n  this machine has no IPv6, libpq will not fall back to IPv4 --"
+            "\n  pin an A record with hostaddr=<ipv4> in the DSN."
+        )
+    if "connection refused" in low or "timed out" in low or "timeout" in low:
+        return (
+            "\n  Nothing is listening. Check the DSN host and port, and that the"
+            "\n  Neon endpoint is not suspended -- Neon scales to zero and the"
+            "\n  first connect after an idle period can be slow or refused."
+        )
+    if "password authentication failed" in low or "authentication" in low:
+        return (
+            "\n  Authentication was rejected. The role or password is wrong, or"
+            "\n  the role is not granted on this database. Re-run `neon env pull`."
+        )
+    if "does not exist" in low:
+        return (
+            "\n  The database or role named in the DSN does not exist. Re-run"
+            "\n  `neon env pull` to get the current values."
+        )
+    return (
+        "\n  The database is unreachable. Check the DSN and that the endpoint is"
+        "\n  not suspended (Neon scales to zero)."
+    )
+
+
 async def main() -> int:
     from app.config import settings
     from app.db import check_connection, describe, open_memory, run_migrations
 
     pooled = os.environ.get("DATABASE_URL") or settings.DB_URI
-    unpooled = os.environ.get("DATABASE_URL_UNPOOLED")
+    unpooled = settings.DATABASE_URL_UNPOOLED
 
     print("\n=== Configuration ===")
     info = describe()
@@ -67,8 +118,7 @@ async def main() -> int:
     ok, detail = await check_connection()
     check("Database answers SELECT 1", ok, detail)
     if not ok:
-        print("\n  The database is unreachable. Check the DSN and that the")
-        print("  endpoint is not suspended (Neon scales to zero).")
+        print(_failure_hint(detail))
         return 1
 
     # 5. Migrations are idempotent and must succeed on a clean database.

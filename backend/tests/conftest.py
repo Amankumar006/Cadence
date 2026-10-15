@@ -20,6 +20,15 @@ os.environ.setdefault("DEMO_MODE", "false")
 os.environ.setdefault("LLM_MAX_ATTEMPTS", "1")
 os.environ.setdefault("DEV_FALLBACK_USER_ID", "mock_user_123")
 
+# The suite must not see a developer's real database. `neon env pull` writes
+# DATABASE_URL into the repo-root .env, and pydantic-settings loads that into the
+# Settings singleton at import time -- so without this, a machine with a live
+# Neon .env would point the whole suite at it (and the DSN tests would fail,
+# since they assert on the localhost default). Popped, not set to "", so the
+# field falls back to DB_URI.
+os.environ.pop("DATABASE_URL", None)
+os.environ.pop("DATABASE_URL_UNPOOLED", None)
+
 # firebase_admin's ``firestore_async.client()`` resolves the default app before
 # doing anything, so an app must exist even though every call is faked.
 import firebase_admin  # noqa: E402

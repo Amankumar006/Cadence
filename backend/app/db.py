@@ -28,9 +28,10 @@ Driver notes, per the Neon agent skills:
 """
 
 import logging
-import os
+import socket
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict, Tuple
+from typing import Any, AsyncIterator, Dict, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
@@ -77,7 +78,7 @@ async def open_memory() -> AsyncIterator[Tuple[AsyncPostgresStore, AsyncPostgres
     Migrations run first, on the *direct* connection, then the live pools open
     on the *pooled* one. Both pools are closed on exit.
     """
-    if settings.using_neon and not os.environ.get("DATABASE_URL_UNPOOLED"):
+    if settings.using_neon and not settings.DATABASE_URL_UNPOOLED:
         logger.warning(
             "Neon DSN detected but DATABASE_URL_UNPOOLED is unset; running DDL "
             "over the pooled endpoint, which can fail on Neon. Set it with "
@@ -135,25 +136,77 @@ async def run_migrations() -> None:
         await conn.close()
 
 
+# Errors that mean "we never reached the server", as opposed to "the server
+# rejected us". Only these are worth an IPv4 retry.
+_NETWORK_ERRORS = ("network is unreachable", "no route to host", "connection refused")
+
+
+def _ipv4_for(host: str) -> Optional[str]:
+    """The first IPv4 address for ``host``, or None.
+
+    A host can resolve to both A and AAAA records. libpq prefers the AAAA record
+    and does not fall back when IPv6 has no route, so a machine without IPv6
+    cannot reach a dual-stack host at all. Pinning an A record with ``hostaddr``
+    fixes that without touching the DSN's ``host``, which stays the SNI name and
+    the certificate name -- Neon routes on it.
+    """
+    try:
+        infos = socket.getaddrinfo(host, 5432, socket.AF_INET, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return None
+    return infos[0][4][0] if infos else None
+
+
+def _with_hostaddr(dsn: str, ipv4: str) -> str:
+    """Add ``hostaddr`` to a DSN, leaving ``host`` (the SNI name) untouched."""
+    parsed = urlparse(dsn)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["hostaddr"] = ipv4
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
 async def check_connection() -> Tuple[bool, str]:
     """Verify the database answers, returning ``(ok, detail)``.
 
     Async, so it never blocks the event loop the way a sync ``psycopg.connect``
     inside an async endpoint does.
+
+    If the first attempt fails with a routing error, it retries with an IPv4
+    address pinned. That is not sandbox hackery: any host without an IPv6 route
+    hits this, and libpq will not recover on its own. Reporting the *second*
+    failure is also more honest -- otherwise an unreachable IPv6 address masks
+    whatever is really wrong further down the stack.
     """
     dsn = settings.pooled_dsn()
-    try:
-        conn = await AsyncConnection.connect(dsn, connect_timeout=5, **_conn_kwargs())
-    except Exception as err:
-        return False, f"{type(err).__name__}: {err}"
-    try:
-        cur = await conn.execute("SELECT 1 AS ok")
-        row = await cur.fetchone()
-        return True, f"SELECT 1 -> {row['ok'] if row else 'no row'}"
-    except Exception as err:
-        return False, f"{type(err).__name__}: {err}"
-    finally:
-        await conn.close()
+    attempts = [dsn]
+
+    host = urlparse(dsn).hostname
+    ipv4 = _ipv4_for(host) if host else None
+    if ipv4:
+        attempts.append(_with_hostaddr(dsn, ipv4))
+
+    last = ""
+    for attempt in attempts:
+        try:
+            conn = await AsyncConnection.connect(
+                attempt, connect_timeout=8, **_conn_kwargs()
+            )
+        except Exception as err:
+            last = f"{type(err).__name__}: {err}"
+            low = last.lower()
+            if not any(e in low for e in _NETWORK_ERRORS):
+                return False, last  # not a routing problem; retrying won't help
+            continue
+        try:
+            cur = await conn.execute("SELECT 1 AS ok")
+            row = await cur.fetchone()
+            return True, f"SELECT 1 -> {row['ok'] if row else 'no row'}"
+        except Exception as err:
+            return False, f"{type(err).__name__}: {err}"
+        finally:
+            await conn.close()
+
+    return False, last
 
 
 def describe() -> Dict[str, Any]:

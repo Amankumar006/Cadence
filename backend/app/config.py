@@ -7,6 +7,14 @@ class Settings(BaseSettings):
     PORT: int = 8000
 
     # ── Storage ──
+    # These are real fields, not os.environ lookups. `neon env pull` writes them
+    # into .env, and pydantic-settings loads a .env into fields -- it does NOT
+    # populate os.environ. Reading os.environ directly therefore missed every
+    # value the CLI pulled, and the app silently fell back to the localhost
+    # default below.
+    DATABASE_URL: str = ""
+    DATABASE_URL_UNPOOLED: str = ""
+
     # Neon hands back two URLs for the same database, and they are not
     # interchangeable:
     #
@@ -71,10 +79,21 @@ class Settings(BaseSettings):
     DEV_FALLBACK_USER_ID: str = "mock_user_123"
 
     # Use pydantic-settings config to load from .env file relative to the root directory
+    # `neon env pull` writes .env at the *repo root*, next to neon.ts, because
+    # that is where the Neon project is linked. This module used to look only at
+    # backend/.env, so a freshly pulled DATABASE_URL was silently ignored and the
+    # app fell back to the localhost default. Both locations are read, root first
+    # so it wins when both exist.
     model_config = SettingsConfigDict(
-        env_file=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+        env_file=(
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                ".env",
+            ),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+        ),
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
     )
 
     def pooled_dsn(self) -> str:
@@ -83,7 +102,7 @@ class Settings(BaseSettings):
         Prefers Neon's pooled `DATABASE_URL`, falling back to `DB_URI` for a
         plain local Postgres.
         """
-        return os.environ.get("DATABASE_URL") or self.DB_URI
+        return self.DATABASE_URL or self.DB_URI
 
     def direct_dsn(self) -> str:
         """Connection string for DDL and migrations.
@@ -92,7 +111,7 @@ class Settings(BaseSettings):
         the pooled DSN — on Neon that is the wrong choice for DDL, so the
         caller is expected to warn; on a local Postgres it is simply right.
         """
-        return os.environ.get("DATABASE_URL_UNPOOLED") or self.pooled_dsn()
+        return self.DATABASE_URL_UNPOOLED or self.pooled_dsn()
 
     @property
     def using_neon(self) -> bool:

@@ -1,6 +1,7 @@
 import logging
 import re
 import base64
+import datetime
 import httpx
 import asyncio
 from typing import Optional
@@ -370,6 +371,34 @@ Only extract dates for the current academic year 2025-26."""
         logger.warning("Failed to parse scraped calendar with Gemini: %s", e)
         return await run_gemini_fallback(college_key, college)
 
+def _mock_calendar() -> dict:
+    """Build the mock academic calendar for `test_*` users.
+
+    The dates are derived from *today* rather than hardcoded. The previous
+    literals (CIE-1 on 2026-06-16, SEE on 2026-07-15, a 2026-06-21 holiday)
+    had all drifted into the past, so every mock user got a calendar whose
+    exams were already over and whose "upcoming" SEE was months gone.
+    """
+    today = datetime.date.today()
+    cie_start = today + datetime.timedelta(days=14)
+    cie_end = cie_start + datetime.timedelta(days=4)
+    holiday = today + datetime.timedelta(days=7)
+    see_start = today + datetime.timedelta(days=60)
+    return {
+        "cie_dates": [
+            {
+                "name": "CIE-1",
+                "start_date": cie_start.isoformat(),
+                "end_date": cie_end.isoformat(),
+            }
+        ],
+        "see_start": see_start.isoformat(),
+        "holidays": [
+            {"date": holiday.isoformat(), "name": "Yoga Day"}
+        ],
+    }
+
+
 async def run_college_calendar_scraper_task(user_id: str, college_name: str):
     """Background task to match college, scrape calendar, save to Firestore, and notify user."""
     logger.info(f"Background task: scraping calendar for user={user_id}, college={college_name}")
@@ -377,15 +406,7 @@ async def run_college_calendar_scraper_task(user_id: str, college_name: str):
         db = firestore_async.client()
         if user_id.startswith("test_"):
             logger.info("Using mock calendar for test user.")
-            mock_calendar = {
-                "cie_dates": [
-                    {"name": "CIE-1", "start_date": "2026-06-16", "end_date": "2026-06-20"}
-                ],
-                "see_start": "2026-07-15",
-                "holidays": [
-                    {"date": "2026-06-21", "name": "Yoga Day"}
-                ]
-            }
+            mock_calendar = _mock_calendar()
             await db.collection("academic_calendar").document(user_id).set(mock_calendar)
             await db.collection("users").document(user_id).set({
                 "calendar_status": "scraped",

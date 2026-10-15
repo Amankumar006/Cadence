@@ -47,5 +47,17 @@ service cloud.firestore {
     match /academic_calendar/{uid} {
       allow read, write: if request.auth != null && request.auth.uid == uid;
     }
+
+    // Scheduled push notifications. The backend writes these via the Admin SDK,
+    // which bypasses rules, but the client reads them to render the in-app
+    // notification list -- without this rule every read was denied and the list
+    // came back empty.
+    match /notifications/{uid}/pending/{date} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      // The client may mark a notification read/dismissed; it must not forge
+      // one, and it must not touch another user's.
+      allow update, delete: if request.auth != null && request.auth.uid == uid;
+      allow create: if false;
+    }
   }
 }

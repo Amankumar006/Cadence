@@ -44,6 +44,35 @@ if os.path.exists(settings.FIREBASE_SERVICE_ACCOUNT_PATH):
     except Exception as e:
         logger.error("Failed to initialize Firebase Admin SDK from file: %s", e)
 
+# The Firebase project this repo deploys to. `.firebaserc` is the source of
+# truth; FIREBASE_PROJECT_ID overrides it. The previous fallback hardcoded
+# "campus-connect-enanq", which is a *different* project from the one in
+# .firebaserc (agent-ad07f) -- so a deploy without FIREBASE_PROJECT_ID set
+# verified tokens against the wrong project and every request 401'd.
+def _default_project_id() -> str:
+    if settings.FIREBASE_PROJECT_ID:
+        return settings.FIREBASE_PROJECT_ID
+    try:
+        import json
+        from pathlib import Path
+
+        # backend/app/api/auth.py -> repo root
+        firebaserc = Path(__file__).resolve().parents[3] / ".firebaserc"
+        if firebaserc.exists():
+            data = json.loads(firebaserc.read_text())
+            project = (data.get("projects") or {}).get("default")
+            if project:
+                logger.info("Using Firebase project '%s' from .firebaserc", project)
+                return project
+    except (OSError, ValueError) as err:  # pragma: no cover - defensive
+        logger.warning("Could not read .firebaserc for the project id: %s", err)
+    logger.warning(
+        "No Firebase project id configured. Set FIREBASE_PROJECT_ID; token "
+        "verification will fail without it."
+    )
+    return ""
+
+
 # If not initialized, try env variables
 if not firebase_initialized and settings.FIREBASE_CLIENT_EMAIL and settings.FIREBASE_PRIVATE_KEY:
     try:
@@ -51,7 +80,7 @@ if not firebase_initialized and settings.FIREBASE_CLIENT_EMAIL and settings.FIRE
             formatted_key = settings.FIREBASE_PRIVATE_KEY.replace("\\n", "\n")
             cred_dict = {
                 "type": "service_account",
-                "project_id": settings.FIREBASE_PROJECT_ID or "campus-connect-enanq",
+                "project_id": _default_project_id(),
                 "private_key": formatted_key,
                 "client_email": settings.FIREBASE_CLIENT_EMAIL,
                 "token_uri": "https://oauth2.googleapis.com/token",

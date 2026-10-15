@@ -6,7 +6,7 @@ import re
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Request
 from firebase_admin import firestore_async
-from app.agents.llm import astructured
+from app.agents.llm import ROUTER, astructured
 from app.agents.schemas import SyllabusLink
 from app.api.auth import get_current_user, resolve_user_id
 from app.config import settings
@@ -102,7 +102,7 @@ If the note is related to one of the subjects, choose the best matching subject,
 (usually 1-indexed), and unit title from the syllabus. If there is no match, leave the
 subject empty."""
 
-        link = await astructured(prompt, SyllabusLink)
+        link = await astructured(prompt, SyllabusLink, tier=ROUTER, label="syllabus_link")
         if link is None or not link.matched:
             return None
 

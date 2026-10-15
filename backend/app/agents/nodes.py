@@ -6,13 +6,14 @@ import re
 from typing import Any, Dict
 from langgraph.store.base import BaseStore
 from langchain_core.runnables import RunnableConfig
-from app.agents.llm import atext, astructured, bypass_llm
+from app.agents.llm import PLANNER, ROUTER, atext, astructured, bypass_llm
 from app.agents.schemas import (
     IntentClassification,
     NoteSummary,
     ScheduleProposal,
 )
 from app.agents.state import AgentState
+from app.config import settings
 from app.memory.store import save_user_profile, sync_and_load_user_profile
 from app.tools.memory import store_preference_func
 from app.tools.timetable import fetch_timetable_func
@@ -21,6 +22,16 @@ from app.tools.notifications import schedule_push_func, send_immediate_push
 from app.tools.tmdb import search_movies_func
 from app.agents.discovery import identify_missing_slots
 from app.agents.parser import parse_due_date, parse_user_info
+from app.agents.prompts import (
+    CHAT_INSTRUCTIONS,
+    CLASSIFY_INSTRUCTIONS,
+    SCHEDULE_OUTPUT_SHAPE,
+    SCHEDULE_ROLE,
+    SCHEDULE_RULES,
+    build_prompt,
+    log_prompt_shape,
+    section,
+)
 from firebase_admin import firestore_async
 
 logger = logging.getLogger("app.agents.nodes")
@@ -39,7 +50,9 @@ Note content: {body}"""
         subject="General",
         tags=["general"],
     )
-    result = await astructured(prompt, NoteSummary, user_id=user_id, fallback=fallback)
+    result = await astructured(
+        prompt, NoteSummary, user_id=user_id, fallback=fallback, tier=PLANNER, label="note_summary"
+    )
     logger.info("Note summarized: subject=%s tags=%s", result.subject, result.tags)
     return {"summary": result.summary, "subject": result.subject, "tags": result.tags}
 
@@ -122,21 +135,15 @@ async def classify_intent(state: AgentState, store: BaseStore) -> Dict[str, Any]
         if last_topic == "college":
             context_str += "\nCRITICAL: If the user provides a college name, abbreviation, or association (e.g. 'BTI', 'Bti', 'RVCE', 'BTI associated with vtu'), you MUST classify the 'intent' as 'info_provided'."
             
-    classify_prompt = f"""You are an intent classifier for a personal AI academic scheduler. {context_str}
-Classify the user's latest message into one of these intents:
-- "schedule_build": User wants to build/generate/plan a schedule for a day or week (e.g., "schedule my day", "plan today", "what's my schedule").
-- "schedule_edit": User wants to edit/change a proposed or existing schedule (e.g., "move gym to 7pm", "remove the study block").
-- "entertainment_rec": User wants movie, show, or entertainment recommendations.
-- "location_trigger": Automated geofence arrival messages (e.g., "arrived at gym", "arrived at college").
-- "info_provided": User is sharing/entering/providing NEW information to the system about their college name, course details, timetable, syllabus, academic events (CIE/SEE/viva/record), or personal routines (e.g., "I study at RVCE", "CIE-1 is on June 20", "I have a lab record due tomorrow", "I go to gym at 6pm daily", "I finished unit 2", "no", "none", "nothing this week", "Bti", "BTI associated with vtu"). IMPORTANT: This is only for inputting/saving new data.
-- "general": General chit-chat, greetings, or questions, including requests to view, retrieve, check, or show their existing classes, timetable, calendar, or tasks (e.g., "what are my classes on Monday", "show my timetable", "give my Monday college timetable", "hi", "how are you", "who are you").
-
-User Message: "{last_message}"
-
-Respond with the intent, the scope ("day" or "week"), and the date the message refers to.
-Resolve relative dates ("today", "tomorrow", "next Monday", "20 Oct") to an absolute
-YYYY-MM-DD date using today's date: {datetime.date.today().isoformat()}.
-If no date is mentioned or implied, leave the date empty."""
+    # Cache-friendly order: static instructions, then the discovery context,
+    # then the date, and the user message dead last (it is the only part that
+    # changes between two messages from the same user).
+    classify_prompt = build_prompt(
+        CLASSIFY_INSTRUCTIONS,
+        context_str,
+        f"Today's date: {datetime.date.today().isoformat()}",
+        f'User Message: "{last_message}"',
+    )
 
     intent = "general"
     intent_scope = "day"
@@ -148,7 +155,11 @@ If no date is mentioned or implied, leave the date empty."""
         intent_date = parse_date_from_message(last_message)
     else:
         parsed = await astructured(
-            classify_prompt, IntentClassification, user_id=user_id
+            classify_prompt,
+            IntentClassification,
+            user_id=user_id,
+            tier=ROUTER,
+            label="intent",
         )
         if parsed is None:
             logger.warning("Classification failed; using heuristic fallback")
@@ -931,107 +942,61 @@ async def build_schedule(state: AgentState) -> Dict[str, Any]:
     else:
         feedback_str = "No previous feedback."
         
-    # Format the SCHEDULE_PROMPT
-    prompt = f"""You are a personal AI scheduler. Build a realistic, personalized schedule for {date} ({weekday_name}).
- 
-═══════════════════════════════════════════
-FIXED CLASSES — DO NOT MOVE OR REMOVE
-═══════════════════════════════════════════
-{timetable_classes}
-{movie_info_str}
- 
-═══════════════════════════════════════════
-PERSONAL FIXED BLOCKS — NON-NEGOTIABLE
-(treat exactly like college classes, never move)
-═══════════════════════════════════════════
-{non_negotiable_str}
- 
-═══════════════════════════════════════════
-PERSONAL FLEXIBLE BLOCKS — schedule if space allows
-═══════════════════════════════════════════
-{flexible_str}
- 
-═══════════════════════════════════════════
-PENDING TASKS DUE SOON
-═══════════════════════════════════════════
-{pending_tasks_str}
- 
-═══════════════════════════════════════════
-RECENT NOTES CONTEXT
-═══════════════════════════════════════════
-{recent_notes_str}
- 
-═══════════════════════════════════════════
-ACADEMIC EVENTS DUE SOON
-═══════════════════════════════════════════
-{academic_events_str}
- 
-═══════════════════════════════════════════
-ACADEMIC CALENDAR
-═══════════════════════════════════════════
-CIE dates: {json.dumps(cie_dates)}
-SEE starts: {see_start}
-Next holiday: {next_holiday}
- 
-═══════════════════════════════════════════
-SYLLABUS RISK ASSESSMENT
-═══════════════════════════════════════════
-{risk_assessment_str}
- 
-═══════════════════════════════════════════
-USER PROFILE
-═══════════════════════════════════════════
-Role: {role}
+    # Assemble the prompt in implicit-cache order: static instructions and the
+    # output shape first (identical on every request), then stable profile
+    # context, then day-specific context, and the volatile date/feedback last.
+    # Gemini caches the prefix, so a date in the opening line would disable
+    # caching entirely. See app/agents/prompts.py.
+    prompt = build_prompt(
+        SCHEDULE_ROLE,
+        SCHEDULE_RULES,
+        SCHEDULE_OUTPUT_SHAPE,
+        section(
+            "USER PROFILE",
+            f"""Role: {role}
 Wake time target: {wake_time} (actual avg: {actual_wake_avg})
 Sleep target: {sleep_target}
 Peak focus time: {peak_focus_time}
 Study block length: {study_block_pref}
 Gym days: {gym_days} at {gym_time}
-Mode: {current_mode}
- 
-═══════════════════════════════════════════
-BEHAVIORAL PATTERNS (learned)
-═══════════════════════════════════════════
-{patterns_str}
-Example: gym_monday: 0.8 means they skip gym 80% of Mondays — don't schedule gym today if it's Monday.
- 
-═══════════════════════════════════════════
-USER FEEDBACK ON PREVIOUS PROPOSAL
-═══════════════════════════════════════════
-{feedback_str}
-(Apply these edits exactly. If empty, ignore.)
- 
-═══════════════════════════════════════════
-RULES
-═══════════════════════════════════════════
-1. Never schedule two blocks at the same time.
-2. Never schedule over non-negotiable personal blocks. They must remain exactly at their fixed time.
-3. Add 15-min buffer before every Fixed Class or Non-Negotiable Personal Block for preparation/commute.
-4. Prioritize tasks by deadline proximity, not just priority label.
-5. Never schedule deep study within 30 min of a meal.
-6. If today is a gym day AND skip_probability < 0.6, include gym. If skip_probability > 0.6, either omit it or append '(you often skip this)' to the block's notes.
-7. In weekend mode, on Saturdays you must include the Saturday movie night block at exactly 21:30.
-8. Always end with a sleep block at sleep_target.
-9. Apply these Scheduling Rules for Academic Events (THESE MANDATORILY OVERRIDE GENERAL PREFERENCES SUCH AS STUDY BLOCK LENGTH):
-   - CIE within 7 days → You MUST add a 2hr (120 min) study block daily for that subject.
-   - CIE within 3 days → You MUST add a 3hr (180 min) study block daily for that subject (do NOT split it, and do NOT use the user's standard 90 min preference). The block's notes or title MUST contain the word "CRITICAL" and the phrase "CIE prep (CRITICAL)".
-   - Lab record due tomorrow → You MUST add a 1.5hr (90 min) lab writing block this evening (post 17:00).
-   - Assignment due tomorrow → You MUST add a 1.5hr (90 min) study block today to complete it, and mark the notes or title as "Urgent".
-   - SEE within 14 days → You MUST restructure the entire day's schedule to focus heavily on revision.
- 
-Return ONLY a JSON object of this exact shape:
-{{
-  "blocks": [
-    {{
-      "time": "HH:MM",
-      "title": "Block title",
-      "type": "work|study|personal|health|rest|ent",
-      "duration_min": 60,
-      "notes": "Context or reminder text shown to user"
-    }}
-  ]
-}}
-"""
+Mode: {current_mode}""",
+        ),
+        section(
+            "BEHAVIORAL PATTERNS (learned)",
+            patterns_str,
+            "gym_monday: 0.8 means they skip gym 80% of Mondays - don't schedule gym today if it's Monday.",
+        ),
+        section("FIXED CLASSES", timetable_classes, "DO NOT MOVE OR REMOVE"),
+        section(
+            "PERSONAL FIXED BLOCKS",
+            non_negotiable_str,
+            "treat exactly like college classes, never move",
+        ),
+        section(
+            "PERSONAL FLEXIBLE BLOCKS",
+            flexible_str,
+            "schedule if space allows",
+        ),
+        section("ACADEMIC EVENTS DUE SOON", academic_events_str),
+        section(
+            "ACADEMIC CALENDAR",
+            f"""CIE dates: {json.dumps(cie_dates)}
+SEE starts: {see_start}
+Next holiday: {next_holiday}""",
+        ),
+        section("SYLLABUS RISK ASSESSMENT", risk_assessment_str),
+        section("PENDING TASKS DUE SOON", pending_tasks_str),
+        section("RECENT NOTES CONTEXT", recent_notes_str),
+        movie_info_str,
+        section(
+            "USER FEEDBACK ON PREVIOUS PROPOSAL",
+            feedback_str,
+            "Apply these edits exactly. If empty, ignore.",
+        ),
+        # Volatile last: this line is the only part that changes between two
+        # runs for the same user on different days.
+        f"Build the schedule for {date} ({weekday_name}).",
+    )
 
     logger.info("Generated schedule prompt for date: %s", date)
 
@@ -1056,7 +1021,10 @@ Return ONLY a JSON object of this exact shape:
     else:
         # Schema-constrained call: the model cannot emit malformed JSON, and
         # every block is validated (time/title/duration/type) before use.
-        proposal = await astructured(prompt, ScheduleProposal, user_id=user_id)
+        log_prompt_shape("schedule", prompt, settings.PRIMARY_MODEL)
+        proposal = await astructured(
+            prompt, ScheduleProposal, user_id=user_id, tier=PLANNER, label="schedule"
+        )
 
         if proposal is None or not proposal.blocks:
             logger.error(
@@ -1187,29 +1155,26 @@ async def general_chat(state: AgentState, store: BaseStore) -> Dict[str, Any]:
             history_parts.append(f"{role}: {m.get('content', '')}")
     
     conversation = "\n".join(history_parts) or "User: Hello"
+    last_user_msg = messages[-1].content if messages and hasattr(messages[-1], "content") else "Hello"
     
-    chat_prompt = f"""You are a helpful personal AI assistant for students and working professionals.
-You help with scheduling, studying, and productivity. Be concise, friendly, and helpful.
+    # Cache-friendly order: static instructions, then context blocks, then the
+    # conversation, with the latest user message dead last. It is the only part
+    # that changes between two messages from the same user.
+    chat_prompt = build_prompt(
+        CHAT_INSTRUCTIONS,
+        section("USER PROFILE", profile_summary),
+        section(f"TIMETABLE TODAY ({weekday})", classes_summary),
+        section("ACADEMIC EVENTS", events_summary),
+        section("PENDING TASKS", tasks_summary),
+        f"Conversation so far:\n{conversation}",
+        f"Latest user message: {last_user_msg}",
+    )
 
-User Context:
-- User ID: {user_id}
-- Current Date/Query Date: {date} ({weekday})
-- User Profile: {profile_summary}
-- College Timetable for {weekday}:
-{classes_summary}
-- Academic Events:
-{events_summary}
-- Pending Tasks:
-{tasks_summary}
-
-Conversation so far:
-{conversation}
-
-Respond to the latest user message. If the user is asking about their classes, timetable, exams, or tasks, use the provided context to answer accurately. If they haven't uploaded a timetable/syllabus but are asking about it, guide them on how to upload a photo/document in the Academics tab."""
-    
     # Free-text response: no schema, but still bounded retries + fallback.
     fallback_text = "I'm here to help you plan your day and stay productive! Try saying 'schedule my day' to get started."
-    response_text = await atext(chat_prompt, user_id=user_id, fallback=fallback_text)
+    response_text = await atext(
+        chat_prompt, user_id=user_id, fallback=fallback_text, tier=PLANNER, label="chat"
+    )
     if response_text == fallback_text:
         logger.warning("general_chat LLM call failed or was bypassed; using fallback response.")
         

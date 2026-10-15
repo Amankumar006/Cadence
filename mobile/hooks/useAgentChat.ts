@@ -1,232 +1,261 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { fetch as expoFetch } from "expo/fetch";
+import { useChat } from "@ai-sdk/react";
+import { DefaultChatTransport } from "ai";
+import { z } from "zod";
 import { authService } from "../services/firebase";
 import { API_URL, authHeaders } from "../services/apiHeaders";
+
+/**
+ * Chat transport for the Cadence backend.
+ *
+ * Three things make this more than a one-liner:
+ *
+ * 1. React Native's `fetch` does not support streaming responses, so the AI
+ *    SDK would buffer the whole SSE stream before handing anything to the UI.
+ *    `expo/fetch` does, and it is what makes token-by-token rendering work.
+ * 2. The app is not served from the backend's origin, so the transport needs
+ *    an absolute URL rather than the SDK's default relative `/api/chat`.
+ * 3. Every backend endpoint requires a Firebase ID token, which is fetched
+ *    asynchronously per request — hence the resolvable `headers` and `body`.
+ */
+const scheduleBlockSchema = z
+  .object({
+    time: z.string(),
+    title: z.string(),
+    type: z.string(),
+    duration_min: z.number(),
+    notes: z.string(),
+  })
+  .passthrough();
+
+/** A `data-schedule` part: either a proposal awaiting approval, or a commit. */
+export const schedulePartSchema = z
+  .object({
+    status: z.enum(["proposed", "approved"]),
+    schedule: z.array(scheduleBlockSchema),
+  })
+  .passthrough();
 
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
-  data?: any;
+  data?: { schedule?: any[]; status?: string };
   createdAt: Date;
 }
 
-export function useAgentChat(threadId: string) {
-  const [token, setToken] = useState<string | null>(null);
-  const [userId, setUserId] = useState<string>(authService.currentUser?.uid || "mock_user_123");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState<string>("");
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [isApproving, setIsApproving] = useState<boolean>(false);
+/** The chat hook's public shape, kept stable so screens do not have to change. */
+export interface UseAgentChat {
+  messages: ChatMessage[];
+  setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
+  input: string;
+  setInput: React.Dispatch<React.SetStateAction<string>>;
+  isLoading: boolean;
+  isApproving: boolean;
+  isOffline: boolean;
+  handleSubmit: () => void;
+  approveSchedule: (feedback: { approved: boolean; edits: any[] }) => Promise<void>;
+}
+
+const DEV_USER_ID = "mock_user_123";
+
+/** Flatten a UIMessage's text parts into the plain string the backend wants. */
+function textOf(message: { parts?: any[] }): string {
+  return (message.parts ?? [])
+    .filter((p) => p.type === "text")
+    .map((p) => p.text ?? "")
+    .join("");
+}
+
+export function useAgentChat(threadId: string): UseAgentChat {
+  const [userId, setUserId] = useState<string>(
+    authService.currentUser?.uid || DEV_USER_ID
+  );
   const [isOffline, setIsOffline] = useState<boolean>(false);
-  const msgIdCounter = useRef(0);
+  const [isApproving, setIsApproving] = useState<boolean>(false);
+  const [input, setInput] = useState<string>("");
+  // Messages the client owns because the backend has no endpoint that produces
+  // them: the local echo of an approval, and its acknowledgement.
+  const [localMessages, setLocalMessages] = useState<ChatMessage[]>([]);
+
+  // The transport resolves headers and body per request, so it reads the uid
+  // through a ref rather than capturing a stale one from the render it was
+  // created in.
+  const userIdRef = useRef(userId);
+  userIdRef.current = userId;
 
   useEffect(() => {
-    const unsubAuth = authService.onAuthStateChanged(async (user: any) => {
-      if (user) {
-        setUserId(user.uid);
-        try {
-          const jwt = await authService.getIdToken();
-          setToken(jwt);
-        } catch (err) {
-          setToken("mock-dev-token");
-        }
-      } else {
-        setUserId("mock_user_123");
-        setToken("mock-dev-token");
-      }
+    const unsubAuth = authService.onAuthStateChanged((user: any) => {
+      setUserId(user?.uid || DEV_USER_ID);
     });
     return unsubAuth;
   }, []);
 
-  const apiUrl = API_URL;
-
+  // ── Backend reachability ────────────────────────────────────────────────
   useEffect(() => {
+    let cancelled = false;
     const checkConnection = async () => {
       try {
-        const response = await fetch(`${apiUrl}/health`, { method: "GET" });
-        if (response.ok) {
-          setIsOffline(false);
-        } else {
-          setIsOffline(true);
-        }
-      } catch (err) {
-        setIsOffline(true);
+        const response = await expoFetch(`${API_URL}/health`, { method: "GET" });
+        if (!cancelled) setIsOffline(!response.ok);
+      } catch {
+        if (!cancelled) setIsOffline(true);
       }
     };
     checkConnection();
     const interval = setInterval(checkConnection, 10000);
-    return () => clearInterval(interval);
-  }, [apiUrl]);
-
-
-
-  const nextId = (prefix: string) => `${prefix}_${Date.now()}_${++msgIdCounter.current}`;
-
-  // ── Send a chat message to the backend and read the SSE stream ──
-  const handleSubmit = useCallback(async () => {
-    const text = input.trim();
-    if (!text || isLoading) return;
-
-    // Append user message immediately
-    const userMsg: ChatMessage = {
-      id: nextId("user"),
-      role: "user",
-      content: text,
-      createdAt: new Date(),
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
     };
-    setMessages((prev) => [...prev, userMsg]);
+  }, []);
+
+  const transport = useMemo(
+    () =>
+      new DefaultChatTransport({
+        api: `${API_URL}/api/chat`,
+        fetch: expoFetch,
+        credentials: "omit",
+        headers: async () =>
+          await authHeaders({ "Content-Type": "application/json" }),
+        body: async () => ({ user_id: userIdRef.current, thread_id: threadId }),
+        // The SDK posts { id, messages, trigger, messageId }. The backend takes
+        // a single `message` string and rebuilds history from the LangGraph
+        // thread, so the array is dropped and the newest user turn extracted.
+        prepareSendMessagesRequest: ({ api, headers, body, messages }) => {
+          const lastUser = [...messages].reverse().find((m) => m.role === "user");
+          return {
+            api,
+            headers,
+            body: {
+              ...(body || {}),
+              message: lastUser ? textOf(lastUser) : "",
+              messages: undefined,
+            },
+          };
+        },
+      }),
+    [threadId]
+  );
+
+  const chat = useChat({
+    id: threadId,
+    transport,
+    dataPartSchemas: { schedule: schedulePartSchema },
+    onError: (error: Error) => {
+      console.error("Agent chat error:", error);
+    },
+  });
+
+  // ── UIMessage[] -> ChatMessage[] ────────────────────────────────────────
+  // Kept as a projection so the existing message renderer keeps working. Text
+  // parts concatenate into `content`; the typed schedule data part becomes
+  // `data.schedule`, which is what the proposal UI reads.
+  const serverMessages = useMemo<ChatMessage[]>(
+    () =>
+      chat.messages.map((m) => {
+        const parts = (m.parts ?? []) as any[];
+        const content = parts
+          .filter((p) => p.type === "text")
+          .map((p) => p.text ?? "")
+          .join("");
+
+        const schedulePart = parts.find((p) => p.type === "data-schedule");
+        const scheduleData = schedulePart?.data;
+
+        return {
+          id: m.id,
+          role: m.role === "user" ? "user" : "assistant",
+          content,
+          data: scheduleData
+            ? { schedule: scheduleData.schedule, status: scheduleData.status }
+            : undefined,
+          createdAt: new Date(),
+        };
+      }),
+    [chat.messages]
+  );
+
+  const messages = useMemo(
+    () => [...serverMessages, ...localMessages],
+    [serverMessages, localMessages]
+  );
+
+  const handleSubmit = useCallback(() => {
+    const text = input.trim();
+    if (!text || chat.status === "submitted" || chat.status === "streaming") return;
+    setLocalMessages([]);
     setInput("");
-    setIsLoading(true);
+    chat.sendMessage({ text });
+  }, [input, chat]);
 
-    try {
-      const response = await fetch(`${apiUrl}/api/chat`, {
-        method: "POST",
-        headers: await authHeaders(),
-        body: JSON.stringify({
-          user_id: userId,
-          thread_id: threadId,
-          message: text,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      // React Native fetch doesn't support ReadableStream.
-      // Read the full SSE response as text and parse line by line.
-      const responseText = await response.text();
-      let assistantText = "";
-      let proposedSchedule: any = null;
-
-      const lines = responseText.split("\n");
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith("data: ")) continue;
-
-        const payload = trimmed.slice(6); // strip "data: "
-        if (payload === "[DONE]") continue;
-
-        try {
-          const parsed = JSON.parse(payload);
-          if (parsed.type === "text" && parsed.text) {
-            assistantText += parsed.text;
-          } else if (parsed.type === "proposed_schedule" && parsed.schedule) {
-            proposedSchedule = parsed.schedule;
-          } else if (parsed.type === "approved_schedule") {
-            assistantText += assistantText
-              ? "\n✅ Schedule saved!"
-              : "✅ Schedule saved!";
-          } else if (parsed.type === "error") {
-            assistantText += `⚠️ Error: ${parsed.message}`;
-          }
-        } catch {
-          // Not valid JSON — skip
-        }
-      }
-
-      // Append assistant response(s)
-      if (assistantText) {
-        const assistantMsg: ChatMessage = {
-          id: nextId("assistant"),
-          role: "assistant",
-          content: assistantText,
-          createdAt: new Date(),
-        };
-        setMessages((prev) => [...prev, assistantMsg]);
-      }
-
-      if (proposedSchedule) {
-        const scheduleMsg: ChatMessage = {
-          id: nextId("schedule"),
-          role: "assistant",
-          content: JSON.stringify({ type: "proposed_schedule", schedule: proposedSchedule }),
-          data: { schedule: proposedSchedule },
-          createdAt: new Date(),
-        };
-        setMessages((prev) => [...prev, scheduleMsg]);
-      }
-    } catch (err) {
-      console.error("Agent chat error:", err);
-      const errorMsg: ChatMessage = {
-        id: nextId("error"),
-        role: "assistant",
-        content: "Sorry, I couldn't connect to the server. Please check that the backend is running.",
-        createdAt: new Date(),
-      };
-      setMessages((prev) => [...prev, errorMsg]);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [input, isLoading, apiUrl, userId, threadId, token]);
-
-  // ── Approve / edit a proposed schedule ──
+  // ── Approve / edit a proposed schedule ──────────────────────────────────
   const approveSchedule = useCallback(
     async (feedback: { approved: boolean; edits: any[] }) => {
       setIsApproving(true);
       try {
-        const response = await fetch(`${apiUrl}/api/schedule/approve`, {
+        const response = await expoFetch(`${API_URL}/api/schedule/approve`, {
           method: "POST",
-          headers: await authHeaders(),
+          headers: await authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
             thread_id: threadId,
-            user_id: userId,
+            user_id: userIdRef.current,
             feedback,
           }),
         });
 
         const data = await response.json();
-        if (data.status === "success") {
-          // User feedback message
-          let userMsgContent = "Looks good ✓";
-          if (!feedback.approved) {
-            userMsgContent =
-              "Requesting edits:\n" +
-              feedback.edits
-                .map((e) => {
-                  if (e.action === "move") return `• Move "${e.block}" to ${e.new_time}`;
-                  if (e.action === "remove") return `• Remove "${e.block}"`;
-                  return `• ${e.action} "${e.block}"`;
-                })
-                .join("\n");
-          }
+        if (data.status !== "success") {
+          console.error("Approve API failed:", data.message);
+          return;
+        }
 
-          const userMsg: ChatMessage = {
-            id: nextId("user_feedback"),
+        // Echo the decision locally: approving resumes the graph rather than
+        // starting a new turn, so no server message is produced for it.
+        const userContent = feedback.approved
+          ? "Looks good ✓"
+          : "Requesting edits:\n" +
+            feedback.edits
+              .map((e) => {
+                if (e.action === "move") return `• Move "${e.block}" to ${e.new_time}`;
+                if (e.action === "remove") return `• Remove "${e.block}"`;
+                return `• ${e.action} "${e.block}"`;
+              })
+              .join("\n");
+
+        setLocalMessages((prev) => [
+          ...prev,
+          {
+            id: `user_feedback_${Date.now()}`,
             role: "user",
-            content: userMsgContent,
+            content: userContent,
             createdAt: new Date(),
-          };
-
-          const assistantMsg: ChatMessage = {
-            id: nextId("assistant_feedback"),
+          },
+          {
+            id: `assistant_feedback_${Date.now()}`,
             role: "assistant",
             content: feedback.approved
               ? "Awesome! Your schedule has been saved and reminders are set."
-              : "I've rebuilt your schedule with those changes. Here is the new proposal:",
-            data: feedback.approved ? undefined : { schedule: data.proposed_schedule },
+              : "I've rebuilt your schedule with those changes.",
             createdAt: new Date(),
-          };
-
-          setMessages((prev) => [...prev, userMsg, assistantMsg]);
-        } else {
-          console.error("Approve API failed:", data.message);
-        }
+          },
+        ]);
       } catch (err) {
         console.error("Error calling approve endpoint:", err);
       } finally {
         setIsApproving(false);
       }
     },
-    [apiUrl, threadId, token]
+    [threadId]
   );
 
   return {
     messages,
-    setMessages,
+    setMessages: setLocalMessages,
     input,
     setInput,
-    isLoading,
+    isLoading: chat.status === "submitted" || chat.status === "streaming",
     isApproving,
     isOffline,
     handleSubmit,

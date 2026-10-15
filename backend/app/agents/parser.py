@@ -15,7 +15,7 @@ import logging
 import re
 from typing import Optional
 
-from app.agents.llm import astructured, bypass_llm
+from app.agents.llm import PLANNER, astructured, bypass_llm
 from app.agents.schemas import ParsedInfo, SUBJECT_ALIASES
 
 logger = logging.getLogger("app.agents.parser")
@@ -464,7 +464,9 @@ Rules:
 
 Message: {message}"""
 
-    parsed = await astructured(prompt, ParsedInfo, user_id=user_id)
+    parsed = await astructured(
+        prompt, ParsedInfo, user_id=user_id, tier=PLANNER, label="parse"
+    )
     if parsed is None or not parsed.has_data:
         logger.info("LLM extraction produced nothing usable; using heuristic fallback")
         return _parse_heuristically(message)

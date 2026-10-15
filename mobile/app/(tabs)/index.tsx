@@ -4,7 +4,6 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  FlatList,
   StyleSheet,
   KeyboardAvoidingView,
   Platform,
@@ -12,6 +11,7 @@ import {
   Modal
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import { FlashList, type FlashListRef } from "@shopify/flash-list";
 import { useAgentChat } from "../../hooks/useAgentChat";
 import { COLORS, TYPE_COLORS } from "../../constants/colors";
 
@@ -33,7 +33,7 @@ export default function ChatScreen() {
   const [selectedSchedule, setSelectedSchedule] = useState<any[]>([]);
   const [originalSchedule, setOriginalSchedule] = useState<any[]>([]);
   const [expandedBlockIndex, setExpandedBlockIndex] = useState<number | null>(null);
-  const flatListRef = useRef<FlatList>(null);
+  const flatListRef = useRef<FlashListRef<any>>(null);
 
   const openEditModal = (schedule: any[]) => {
     setOriginalSchedule(schedule);
@@ -115,32 +115,24 @@ export default function ChatScreen() {
   const renderMessageItem = ({ item }: { item: any }) => {
     const isUser = item.role === "user";
     
-    let proposedSchedule: any[] | null = null;
-    if (item.data && typeof item.data === "object" && item.data.schedule) {
-      proposedSchedule = item.data.schedule;
-    } else if (item.content && (item.content.includes('"proposed_schedule"') || item.content.startsWith("["))) {
-      try {
-        const parsed = JSON.parse(item.content);
-        if (parsed && typeof parsed === "object" && parsed.type === "proposed_schedule" && Array.isArray(parsed.schedule)) {
-          proposedSchedule = parsed.schedule;
-        } else if (Array.isArray(parsed)) {
-          proposedSchedule = parsed;
-        }
-      } catch (e) {
-        // Failed parsing
-      }
-    }
+    // Schedules arrive as a typed data-schedule part, never as JSON in the
+    // text, so there is nothing to sniff out of `content`.
+    const proposedSchedule: any[] | null =
+      item.data && typeof item.data === "object" && item.data.schedule
+        ? item.data.schedule
+        : null;
 
     return (
       <View style={[styles.messageRow, isUser ? styles.userRow : styles.assistantRow]}>
         <View style={[styles.bubble, isUser ? styles.userBubble : styles.assistantBubble]}>
-          {!proposedSchedule ? (
+          {/* A message can carry both text and a schedule data part — show the
+              text above the schedule rather than replacing it. */}
+          {item.content ? (
             <Text style={[styles.messageText, isUser ? styles.userText : styles.assistantText]}>
               {item.content}
             </Text>
-          ) : (
-            renderProposedSchedule(proposedSchedule)
-          )}
+          ) : null}
+          {proposedSchedule ? renderProposedSchedule(proposedSchedule) : null}
         </View>
       </View>
     );
@@ -158,7 +150,7 @@ export default function ChatScreen() {
             <Text style={styles.offlineBannerText}>Agent offline — check your connection</Text>
           </View>
         )}
-        <FlatList
+        <FlashList
           ref={flatListRef}
           data={messages}
           renderItem={renderMessageItem}
@@ -208,7 +200,7 @@ export default function ChatScreen() {
             <Text style={styles.modalTitle}>Edit Proposed Schedule</Text>
             <Text style={styles.modalSubtitle}>Tap a block to change its start time or remove it.</Text>
             
-            <FlatList
+            <FlashList
               data={selectedSchedule}
               keyExtractor={(item, index) => `${item.title}-${index}`}
               contentContainerStyle={styles.modalList}

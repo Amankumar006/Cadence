@@ -4,7 +4,7 @@ import base64
 import httpx
 import asyncio
 from typing import Optional
-from app.agents.llm import astructured
+from app.agents.llm import PLANNER, astructured
 from app.agents.schemas import (
     AcademicCalendar,
     CollegeMatch,
@@ -292,7 +292,9 @@ Please provide the estimated or actual academic calendar dates for the current a
 If you do not know the exact dates, use typical dates for VTU-affiliated colleges in Karnataka (typically, the odd semester starts around August/September and ends in December/January; even semester starts around February/March and ends in June/July).
 
 Return dates in YYYY-MM-DD format. If a date is unknown, leave the field empty."""
-    calendar = await astructured(prompt, AcademicCalendar)
+    calendar = await astructured(
+        prompt, AcademicCalendar, tier=PLANNER, label="calendar_fallback"
+    )
     if calendar is None:
         return {"status": "manual", "data": {}}
     if calendar.is_empty:
@@ -351,7 +353,9 @@ If a date is not on the page, leave that field empty rather than guessing.
 Only extract dates for the current academic year 2025-26."""
 
     try:
-        calendar = await astructured(prompt, AcademicCalendar)
+        calendar = await astructured(
+            prompt, AcademicCalendar, tier=PLANNER, label="calendar_scrape"
+        )
         if calendar is None:
             raise ValueError("LLM returned no calendar")
         data = calendar.model_dump()

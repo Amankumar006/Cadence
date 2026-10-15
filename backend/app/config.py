@@ -15,9 +15,15 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str = ""
     TMDB_API_KEY: str = ""
 
-    # Model ids. Gemini 2.5 is only served to accounts that already used it,
-    # so the default is the current GA workhorse. Override per environment.
+    # Model ids, per tier. Gemini 2.5 is only served to accounts that already
+    # used it, so these are the current GA line-up:
+    #   gemini-3.8-flash      workhorse — schedule building, parsing, summaries
+    #   gemini-3.5-flash-lite routing   — intent/college classification
+    # Tiering is a latency *and* cost lever: the routing tier is ~2.5x cheaper
+    # than the workhorse and answers in a fraction of the time, so every call
+    # that only needs to pick one of a few labels goes there.
     PRIMARY_MODEL: str = "gemini-3.8-flash"
+    ROUTING_MODEL: str = "gemini-3.5-flash-lite"
     SECONDARY_MODEL: str = "llama-3.3-70b-versatile"
     # Bound on LLM attempts before the deterministic fallback is used.
     LLM_MAX_ATTEMPTS: int = 2
@@ -26,6 +32,9 @@ class Settings(BaseSettings):
     DEMO_MODE: bool = False
 
     # ── Observability ──
+    # LangSmith tracing. Enabled automatically when a key is present; without
+    # one, calls are still logged locally with token/cache-hit counts so
+    # latency and cache behaviour stay measurable.
     LANGCHAIN_TRACING_V2: bool = True
     LANGCHAIN_API_KEY: str = ""
     LANGCHAIN_PROJECT: str = "personal-ai-agent"

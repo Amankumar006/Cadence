@@ -213,6 +213,7 @@ class FakeChatModel:
         self._responder = responder
         self.calls: List[str] = []
         self.structured_calls: List[Any] = []
+        self.tiers_used: List[str] = []
 
     def with_fallbacks(self, others):
         return self
@@ -241,13 +242,20 @@ def install_fake_llm(monkeypatch, responder=None) -> FakeChatModel:
 
     ``responder(prompt, schema)`` returns a dict (validated against ``schema``)
     or a string (for free-text calls).
+
+    Patches the per-tier chain getter, which is what every call site uses. The
+    chain resolves to ``[fake]`` for *any* tier, so adding a new tier can never
+    silently start making real network calls.
     """
     fake = FakeChatModel(responder)
+    fake.tiers_used = []
 
-    def fake_chain():
+    def fake_tier_chain(tier="planner"):
+        fake.tiers_used.append(tier)
         return [fake]
 
-    monkeypatch.setattr("app.agents.llm.get_llm_chain", fake_chain)
+    monkeypatch.setattr("app.agents.llm.get_tier_chain", fake_tier_chain)
+    monkeypatch.setattr("app.agents.llm.get_llm_chain", lambda: [fake])
     monkeypatch.setattr("app.agents.llm._structured_cache", {})
     return fake
 

@@ -15,6 +15,16 @@ logger = logging.getLogger("app.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Export the LangSmith env vars BEFORE the first LLM call. LangChain reads
+    # them lazily per client, so this must happen after the settings are
+    # imported but before any chain is built or invoked.
+    from app.agents.llm import setup_tracing
+
+    if setup_tracing():
+        logger.info(
+            "LangSmith tracing enabled for project '%s'", settings.LANGCHAIN_PROJECT
+        )
+
     # Initialize LangGraph v1 checkpointer and store inside lifespan
     logger.info("Initializing database connection pools...")
     async with (

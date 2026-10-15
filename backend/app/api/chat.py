@@ -1,7 +1,7 @@
-import json
 import logging
 from fastapi import APIRouter, Request, BackgroundTasks, Depends
 from fastapi.responses import StreamingResponse
+from app.api.sse import UIMessageStream
 from langgraph.types import Command
 from app.api.auth import get_current_user, resolve_user_id
 
@@ -65,10 +65,13 @@ async def chat_endpoint(
         }
 
     async def event_stream():
+        stream = UIMessageStream()
         # Track what *this* run produced so we never re-emit a stale schedule
         # left over from a previous turn on the same thread.
         produced = {"propose": False, "commit": False}
         try:
+            yield stream.start()
+
             # Stream updates from LangGraph to capture messages returned by custom nodes
             async for chunk in graph.astream(inputs, config, stream_mode="updates"):
                 for node_name, node_output in chunk.items():
@@ -82,43 +85,33 @@ async def chat_endpoint(
                         for msg in node_output["messages"]:
                             content = msg.content if hasattr(msg, "content") else (msg.get("content", "") if isinstance(msg, dict) else str(msg))
                             if content:
-                                payload = json.dumps({"type": "text", "text": content})
-                                yield f"data: {payload}\n\n"
+                                yield stream.text(content)
 
-            # After stream completes, check state for proposed/approved schedule and yield them
+            # After the run, attach the schedule this run produced as a typed
+            # data part. The client declares the schema in `dataPartSchemas`,
+            # so it receives a parsed object rather than a JSON string.
             final_state = await graph.aget_state(config)
             values = final_state.values or {}
 
             if produced["propose"] and values.get("proposed_schedule"):
-                payload = json.dumps({
-                    "type": "proposed_schedule",
-                    "schedule": values["proposed_schedule"]
+                yield stream.data("schedule", {
+                    "status": "proposed",
+                    "schedule": values["proposed_schedule"],
                 })
-                yield f"data: {payload}\n\n"
 
             if produced["commit"] and values.get("approved_schedule"):
-                payload = json.dumps({
-                    "type": "approved_schedule",
-                    "schedule": values["approved_schedule"]
+                yield stream.data("schedule", {
+                    "status": "approved",
+                    "schedule": values["approved_schedule"],
                 })
-                yield f"data: {payload}\n\n"
 
         except Exception as e:
             logger.error("Error in event_stream: %s", e, exc_info=True)
-            payload = json.dumps({"type": "error", "message": str(e)})
-            yield f"data: {payload}\n\n"
+            yield stream.error(str(e))
 
-        yield "data: [DONE]\n\n"
+        yield stream.done()
 
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
+    return StreamingResponse(event_stream(), headers=UIMessageStream.headers())
 
 
 @router.post("/schedule/approve")

@@ -21,6 +21,7 @@ The system automatically balances academic deadlines, professional tasks, and ho
 - [📂 Project Directory Structure](#-project-directory-structure)
 - [🗄️ Firestore Database Schema](#%EF%B8%8F-firestore-database-schema)
 - [🔌 REST API References](#-rest-api-references)
+- [⚡ Model Tiers, Prompt Caching & Observability](#-model-tiers-prompt-caching--observability)
 - [⚙️ Setup & Installation](#%EF%B8%8F-setup--installation)
 - [📅 Core Scheduling Engine Rules](#-core-scheduling-engine-rules)
 
@@ -88,14 +89,17 @@ The repository is divided into a Python backend service and a TypeScript Expo mo
 │   │   │   ├── llm.py          # Schema-constrained LLM entry points (astructured / atext)
 │   │   │   ├── nodes.py        # Graph computation nodes (Build, Commit, Hydrate)
 │   │   │   ├── parser.py       # Entity & info parser (LLM + regex heuristic fallback)
+│   │   │   ├── prompts.py      # Cache-friendly prompt assembly + static instructions
 │   │   │   ├── schemas.py      # Pydantic models for every structured LLM output
 │   │   │   └── state.py        # AgentState TypedDict definitions
 │   │   ├── api/                # FastAPI routing paths (auth, chat streams, image uploads)
+│   │   │   └── sse.py          # AI SDK v1 UI-message-stream frame writer
 │   │   ├── data/               # Local JSON mappings & college catalogs
 │   │   ├── memory/             # Postgres memory savers & checkpointer configurations
 │   │   ├── tasks/              # APScheduler background jobs (Nightly Learning, Scrapers)
 │   │   ├── tools/              # Specialized agent actions (Syllabus downloader, TMDB movie locator)
 │   │   └── main.py             # FastAPI App root configuration
+│   ├── scripts/                # Dev harness: capture an SSE sample / serve with fakes
 │   ├── tests/                  # pytest suite (in-memory Firestore/LLM fakes, no credentials needed)
 │   ├── requirements.txt        # Backend python dependencies
 │   ├── requirements-dev.txt    # pytest + pytest-asyncio
@@ -105,7 +109,9 @@ The repository is divided into a Python backend service and a TypeScript Expo mo
 │   ├── app/                    # Expo Router structure (Tabs: Schedule, Profile, Academics)
 │   ├── constants/              # Theme details and color tokens
 │   ├── hooks/                  # Custom hooks (useAgentChat, useGeofence, useSchedule)
-│   ├── services/               # Firebase listeners and Local Notification triggers
+│   ├── services/               # Firebase listeners, API URL + auth headers
+│   ├── verify-stream.mjs       # Replay a captured SSE sample through the real SDK transport
+│   ├── verify-transport.mjs    # Assert the transport's request body matches the backend
 │   ├── package.json            # Node.js dependencies
 │   └── app.json                # Expo config manifest
 ├── README.md                   # Visual project guide
@@ -149,9 +155,34 @@ The system stores configuration files, user profile information, and schedule lo
     "message": "schedule my day for 2026-06-15"
   }
   ```
-- **Returns**: `text/event-stream` returning text tokens, intermediate tool outputs, or interrupted proposed schedules.
+- **Returns**: `text/event-stream` in the **AI SDK v1 UI-message-stream**
+  protocol, declared with the `x-vercel-ai-ui-message-stream: v1` response
+  header. The mobile client consumes it with the AI SDK's `useChat`, so the app
+  contains no bespoke SSE parsing.
 - **Thread namespacing**: the thread is stored as `{user_id}:{thread_id}`, so two
   users sending the same constant `thread_id` never share state.
+
+Frames, in the order they arrive:
+
+| Frame | Meaning |
+| --- | --- |
+| `{"type":"start","messageId":"..."}` | Opens the assistant message |
+| `{"type":"text-start","id":"..."}` | Opens a text part |
+| `{"type":"text-delta","id":"...","delta":"..."}` | Appends to that part |
+| `{"type":"text-end","id":"..."}` | Closes it |
+| `{"type":"data-schedule","data":{...}}` | A schedule payload (see below) |
+| `{"type":"error","errorText":"..."}` | Terminal error for the turn |
+| `data: [DONE]` | End of stream |
+
+The `data-schedule` part carries `{"status": "proposed" | "approved",
+"schedule": [block, ...]}`. A block is `{"time": "HH:MM", "title": "...",
+"type": "study", "duration_min": 90, "notes": "..."}`. The client declares the
+shape with `dataPartSchemas`, so it receives a parsed object rather than a JSON
+string.
+
+Only schedules *this run* produced are emitted: the endpoint tracks whether
+`build_schedule` / `commit_schedule` fired, so a stale proposal from an earlier
+turn on the same thread is never replayed. See `backend/app/api/sse.py`.
 
 ### 2. Timetable Image Extraction
 - **Path**: `POST /api/upload/timetable`
@@ -180,6 +211,73 @@ The system stores configuration files, user profile information, and schedule lo
 - **Response**: Status `success` alongside details of saved Firestore schedules.
 
 ---
+
+## ⚡ Model Tiers, Prompt Caching & Observability
+
+Three speed levers, all in `backend/app/agents/llm.py` and
+`backend/app/agents/prompts.py`.
+
+### Two model tiers
+
+Intent classification runs on **every** message, so it is the one call the user
+feels on each keystroke. It does not need the reasoning model.
+
+| Tier | Model | Used by |
+| --- | --- | --- |
+| `PLANNER` | `gemini-3.8-flash` | schedule building, chat, note summaries, calendar extraction |
+| `ROUTER` | `gemini-3.5-flash-lite` | intent classification, college matching, syllabus-link extraction |
+
+Both tiers share the same retry / fallback logic; only the model id and the
+structured-output cache differ. A call site opts in with `tier=ROUTER`.
+
+### Cache-friendly prompt layout
+
+Gemini caches a request's **prefix**, so anything volatile placed early
+invalidates the whole cached region. Every prompt is therefore assembled
+static-first via `build_prompt(...)`:
+
+```
+role / rules / output shape    <- identical on every request, cacheable
+user profile & patterns        <- stable for a given user
+classes, tasks, notes, events  <- changes as data changes
+date, feedback, latest message <- volatile, always last
+```
+
+The schedule prompt previously **opened with the date**, which defeated caching
+entirely. `section(title, body, rule)` keeps the old formatting.
+
+> [!IMPORTANT]
+> **Caching does not fire yet.** `gemini-3.8-flash` only caches a request of at
+> least 4096 input tokens; the assembled schedule prompt measures roughly 1.1k
+> tokens even with a full syllabus loaded. The layout is correct and is a
+> prerequisite, but the prompt needs to grow about 4x before any cache hit is
+> recorded. `tests/test_prompts.py` pins that measurement rather than assuming
+> the win. The prompt was deliberately **not** padded to clear the floor.
+
+### Observability
+
+- Set `LANGCHAIN_API_KEY` to export traces to LangSmith under
+  `LANGCHAIN_PROJECT` (default `personal-ai-agent`). `setup_tracing()` is called
+  from the app lifespan, before the first chain is built.
+- With no key, nothing is exported and every call logs latency plus
+  `input_tokens` / cached-% / `output_tokens` locally instead.
+
+### Mobile: streaming, lists and the transport
+
+The chat screen now uses the AI SDK rather than a hand-rolled SSE parser:
+
+- `expo/fetch` replaces React Native's `fetch`, which cannot stream — without
+  it the SDK buffers the whole response and the user sees nothing until the run
+  ends.
+- `DefaultChatTransport` supplies the absolute `API_URL` (the app is not served
+  from the backend origin), the `Authorization` header resolved per request, and
+  a `prepareSendMessagesRequest` adapter, because the SDK posts a `messages`
+  array while the backend reads a single `message` string.
+- `dataPartSchemas` types the schedule part, so the proposal UI receives an
+  object instead of sniffing JSON out of the text.
+- Chat and schedule lists moved from `FlatList` to **FlashList v2**
+  (`@shopify/flash-list`), which is JS-only with no native module, so it needs no
+  rebuild and drops all the `estimated*` props v1 required.
 
 ## ⚙️ Setup & Installation
 

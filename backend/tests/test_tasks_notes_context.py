@@ -40,10 +40,10 @@ def test_tasks_and_notes_shape_the_schedule(client):
     _chat(client, "DSA Unit 4 has 40% CIE weightage", thread)
 
     events = _chat(client, f"schedule my day for {tomorrow}", thread)
-    proposals = [e for e in events if e["type"] == "proposed_schedule"]
+    proposals = [e["data"]["schedule"] for e in events if e["type"] == "data-schedule"]
     assert len(proposals) == 1, f"expected one proposal, got {[e['type'] for e in events]}"
 
-    schedule = proposals[0]["schedule"]
+    schedule = proposals[0]
     assert schedule, "the proposed schedule must not be empty"
 
     titles = " ".join(

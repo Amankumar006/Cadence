@@ -143,8 +143,13 @@ def test_module_imports_without_any_api_key():
     """A fresh clone must be importable with no keys set at all."""
     import subprocess
     import sys
+    from pathlib import Path
 
-    env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": "."}
+    # Point PYTHONPATH at the backend directory explicitly rather than ".". The
+    # subprocess inherits pytest's cwd, and `npm test` runs pytest from the repo
+    # root, where "." is not the package root.
+    backend_dir = str(Path(__file__).resolve().parents[1])
+    env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": backend_dir}
     code = (
         "import os;"
         "os.environ.pop('GEMINI_API_KEY', None);"

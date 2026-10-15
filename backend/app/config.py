@@ -7,7 +7,29 @@ class Settings(BaseSettings):
     PORT: int = 8000
 
     # ── Storage ──
+    # Neon hands back two URLs for the same database, and they are not
+    # interchangeable:
+    #
+    #   DATABASE_URL          pooled — PgBouncer in transaction mode. Normal
+    #                         application traffic. No session state, no DDL.
+    #   DATABASE_URL_UNPOOLED direct — schema migrations, `setup()` DDL, dumps,
+    #                         LISTEN/NOTIFY, anything relying on SET.
+    #
+    # Running DDL over the pooled endpoint fails in ways that never name
+    # pooling: `prepared statement "s0" already exists`, a `SET search_path`
+    # that does not survive its own transaction, or a write landing in a
+    # read-only transaction the pooler inherited from an earlier client.
+    #
+    # `neon env pull` writes both. If only one is present we fall back to it,
+    # which is correct for local development against a plain Postgres and
+    # merely degraded (not broken) on Neon.
     DB_URI: str = "postgresql://postgres:postgres@localhost:5432/agent_planner"
+    DB_URI_UNPOOLED: str = ""
+
+    # Pool sizing for the LangGraph store. The checkpointer takes a single
+    # connection by design, so only the store is pooled; see app/db.py.
+    DB_POOL_MIN_SIZE: int = 1
+    DB_POOL_MAX_SIZE: int = 10
 
     # ── LLM ──
     GEMINI_API_KEY: str = ""
@@ -54,6 +76,28 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore"
     )
+
+    def pooled_dsn(self) -> str:
+        """Connection string for normal application traffic.
+
+        Prefers Neon's pooled `DATABASE_URL`, falling back to `DB_URI` for a
+        plain local Postgres.
+        """
+        return os.environ.get("DATABASE_URL") or self.DB_URI
+
+    def direct_dsn(self) -> str:
+        """Connection string for DDL and migrations.
+
+        Prefers Neon's unpooled `DATABASE_URL_UNPOOLED`. If it is absent we use
+        the pooled DSN — on Neon that is the wrong choice for DDL, so the
+        caller is expected to warn; on a local Postgres it is simply right.
+        """
+        return os.environ.get("DATABASE_URL_UNPOOLED") or self.pooled_dsn()
+
+    @property
+    def using_neon(self) -> bool:
+        """True when the DSNs point at Neon (they carry a `-pooler` host)."""
+        return "-pooler." in self.pooled_dsn()
 
 
 settings = Settings()

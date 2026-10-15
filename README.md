@@ -284,7 +284,44 @@ The chat screen now uses the AI SDK rather than a hand-rolled SSE parser:
 > [!IMPORTANT]
 > Make sure PostgreSQL is running locally and you have created a database instance before launching the backend memory store.
 
-### 1. Backend Setup
+### 1. Neon Postgres setup
+The LangGraph checkpointer and store live in Postgres. Neon gives you two
+connection strings for the same database and **they are not interchangeable**:
+
+| Variable | What it is | Use it for |
+| --- | --- | --- |
+| `DATABASE_URL` | **Pooled** — hostname carries a `-pooler` suffix, routed through PgBouncer in transaction mode | The application's normal query traffic |
+| `DATABASE_URL_UNPOOLED` | **Direct** — no `-pooler` suffix | Schema migrations, `setup()` DDL, `pg_dump`, logical replication, `LISTEN`/`NOTIFY`, anything relying on `SET` |
+
+Running DDL over the pooled endpoint fails on Neon in ways that never name
+pooling: `prepared statement "s0" already exists`, a `SET search_path` that does
+not survive its own transaction, or a write landing in a read-only transaction
+the pooler inherited from an earlier client. `app/db.py` owns the routing so no
+caller has to remember.
+
+```bash
+# Install the CLI and provision the service (creates neon.ts, .neon, skills)
+npm i -g neon@latest
+neon init -y --org-id <org> --project-id <project> --branch production --services postgres
+neon deploy
+
+# Pull both connection strings into .env
+neon env pull
+```
+
+Then prove the wiring end to end — this drives the same code the running app
+uses, so a pass means the app's startup path works, not just that a socket
+opened:
+
+```bash
+npm run verify:db
+```
+
+It checks that both DSNs are present and target the same database, that the
+database answers, that migrations are idempotent, and that both memory stores
+round-trip a write and a read.
+
+### 2. Backend Setup
 ```bash
 # Navigate & initialize virtualenv
 cd backend
@@ -295,7 +332,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # Create .env file and edit configuration keys
-cp .env.example .env
+cp ../.env.example .env   # or run `neon env pull` at the repo root
 ```
 
 Run the test suite (no Postgres, Firebase, or API keys required):
@@ -303,12 +340,17 @@ Run the test suite (no Postgres, Firebase, or API keys required):
 pip install -r requirements-dev.txt
 pytest
 ```
+
+From the repo root, `npm run build` byte-compiles the backend, lints it with
+ruff, and type-checks the mobile app. `npm test` runs the backend suite. Both
+pick up `backend/.venv` automatically if it exists, so a system Python without
+the dependencies still works.
 Start the local server:
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 2. Mobile Setup
+### 3. Mobile Setup
 ```bash
 # Navigate & install node modules
 cd ../mobile

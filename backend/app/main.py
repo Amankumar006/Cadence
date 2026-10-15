@@ -2,10 +2,8 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.store.postgres.aio import AsyncPostgresStore
-
 from app.config import settings
+from app.db import check_connection, describe, open_memory
 from app.agents.graph import create_graph
 from app.api.chat import router as chat_router
 from app.api.upload import router as upload_router
@@ -25,12 +23,11 @@ async def lifespan(app: FastAPI):
             "LangSmith tracing enabled for project '%s'", settings.LANGCHAIN_PROJECT
         )
 
-    # Initialize LangGraph v1 checkpointer and store inside lifespan
+    # Initialize LangGraph v1 checkpointer and store inside lifespan.
+    # open_memory() runs the DDL migrations on Neon's *direct* connection first,
+    # then opens the live pools on the *pooled* one — see app/db.py.
     logger.info("Initializing database connection pools...")
-    async with (
-        AsyncPostgresStore.from_conn_string(settings.DB_URI) as store,
-        AsyncPostgresSaver.from_conn_string(settings.DB_URI) as checkpointer,
-    ):
+    async with open_memory() as (store, checkpointer):
         # Run setup to automatically create postgres tables if they do not exist
         logger.info("Running store and checkpointer setups...")
         await store.setup()
@@ -85,28 +82,25 @@ async def root():
 @app.get("/health")
 async def health(request: Request):
     import datetime
-    import psycopg
     
     scheduler = getattr(request.app.state, "scheduler", None)
     scheduler_status = "running" if (scheduler and scheduler.running) else "stopped"
     graph_status = "ready" if hasattr(request.app.state, "graph") else "not_ready"
     
-    db_status = "connected"
-    try:
-        # Verify postgres connection
-        with psycopg.connect(settings.DB_URI, connect_timeout=2) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-    except Exception as e:
-        logger.error(f"Database connection check failed: {e}")
-        db_status = f"disconnected: {str(e)}"
-        
+    # Async, and on the pooled DSN. The previous version called the
+    # synchronous psycopg.connect() inside an async endpoint, which blocks the
+    # event loop for every other in-flight request for as long as the connect
+    # takes.
+    ok, detail = await check_connection()
+    db_status = "connected" if ok else f"disconnected: {detail}"
+
     return {
-        "status": "ok" if db_status == "connected" else "error",
+        "status": "ok" if ok else "error",
         "scheduler": scheduler_status,
         "graph": graph_status,
         "database": db_status,
-        "timestamp": datetime.datetime.now().isoformat()
+        "db": describe(),
+        "timestamp": datetime.datetime.now().isoformat(),
     }
 
 

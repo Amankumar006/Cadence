@@ -1,0 +1,22 @@
+{
+  "name": "cadence",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Cadence — personal AI academic scheduler (FastAPI + LangGraph backend, Expo mobile client, Neon Postgres)",
+  "scripts": {
+    "build": "npm run build:backend && npm run lint:backend && npm run build:mobile",
+    "build:backend": "node scripts/py.mjs -m compileall -q backend/app",
+    "build:mobile": "npm --prefix mobile run typecheck",
+    "lint:backend": "node scripts/py.mjs -m ruff check backend/app backend/tests --select F",
+    "typecheck": "npm run build",
+    "test": "npm run test:backend",
+    "test:backend": "node scripts/py.mjs -m pytest backend/tests -q",
+    "verify:db": "node scripts/py.mjs backend/scripts/verify_db.py",
+    "neon:deploy": "neon deploy",
+    "neon:env": "neon env pull"
+  },
+  "dependencies": {
+    "@neon/config": "^1.9.1",
+    "@neon/env": "^1.6.2"
+  }
+}

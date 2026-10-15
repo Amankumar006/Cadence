@@ -20,6 +20,8 @@ from app.tools.calendar import write_calendar_func
 from app.tools.notifications import schedule_push_func, send_immediate_push
 from app.tools.tmdb import search_movies_func
 from app.agents.discovery import identify_missing_slots
+from app.agents.schemas import ExtraItems
+from app.agents.prompts import EXTRA_ITEMS_PROMPT
 from app.context import load_chat_context, load_schedule_context
 from app.agents.parser import parse_due_date, parse_user_info
 from app.agents.scheduler import (
@@ -675,6 +677,58 @@ def _fallback_schedule(scope: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+async def extract_extra_items(state: AgentState) -> List[Dict[str, Any]]:
+    """Ask the LLM what the user mentioned that the deterministic rules miss.
+
+    The deterministic rules in problem_from_context know about classes, CIEs,
+    tasks due today, gym days, the movie mandate and note-driven study. They
+    cannot know that the user just said "I have a group project meeting after
+    lunch" or "need to call the plumber".
+
+    This is the one place the model is allowed to add work, and it is bounded:
+    ExtraSchedulingItem has no `time` field at all, so it cannot place anything.
+    It proposes what, how long, and at most a soft window; problem_from_context
+    clamps every field and _coerce_extra_item drops anything unusable.
+
+    Returns [] on any failure. An empty list means "only the deterministic
+    rules", which is a perfectly good schedule -- it just is not this one.
+    """
+    messages = state.get("messages") or []
+    if not messages:
+        return []
+
+    last = messages[-1]
+    text = (
+        getattr(last, "content", None)
+        if not isinstance(last, dict)
+        else last.get("content", "")
+    )
+    text = str(text or "").strip()
+    if not text:
+        return []
+
+    # Nothing to extract from a bare approval or a short command. This also
+    # keeps the cache-friendly prompt shape: the extraction call is skipped
+    # entirely for the common "schedule my day" turn.
+    if len(text) < 25:
+        return []
+
+    try:
+        parsed = await astructured(
+            EXTRA_ITEMS_PROMPT.format(message=text),
+            ExtraItems,
+            user_id=state.get("user_id"),
+        )
+    except Exception as err:
+        logger.warning("Extra-item extraction failed (%s); using deterministic rules only", err)
+        return []
+
+    if parsed is None:
+        return []
+
+    return [item.model_dump() for item in parsed.items]
+
+
 async def build_schedule(state: AgentState) -> Dict[str, Any]:
     """Generates the proposed schedule based on timetable, profile, and tasks."""
     logger.info("Node: build_schedule")
@@ -967,7 +1021,12 @@ Next holiday: {next_holiday}""",
 
     logger.info("Generated schedule prompt for date: %s", date)
 
-    # 3. Extract the scheduling problem, then solve it with CP-SAT.
+    # 3a. What did the user just say that the deterministic rules cannot see?
+    extra_items = await extract_extra_items(state)
+    if extra_items:
+        logger.info("Extracted %d extra item(s) from the user message", len(extra_items))
+
+    # 3b. Extract the scheduling problem, then solve it with CP-SAT.
     #
     # The split matters. Deciding *what* needs placing and with what constraints
     # is an extraction job the LLM is good at; placing it without overlaps is
@@ -986,6 +1045,7 @@ Next holiday: {next_holiday}""",
         pending_tasks=pending_tasks,
         recent_notes=recent_notes,
         movie_info=movie_info,
+        extra_items=extra_items,
     )
 
     result = solve(problem)

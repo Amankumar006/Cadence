@@ -107,6 +107,26 @@ SCHEDULE_OUTPUT_SHAPE = """Return an object of this exact shape:
 
 SCHEDULE_ROLE = "You are a personal AI scheduler. Build a realistic, personalized schedule for the date given at the end of this prompt."
 
+EXTRA_ITEMS_PROMPT = """Read the user's message and list any concrete activities they mention
+that are not already covered by their timetable, their classes, their pending tasks,
+or their saved routines.
+
+Include things like: a meeting, an appointment, an errand, a call to make, a project
+session, a visit, a deadline they are working on, a class or event they attend.
+
+Do NOT include: things they are merely thinking about, hypotheticals, or vague plans
+with no activity. Do NOT include anything already in their timetable or task list.
+
+For each item give a realistic duration in minutes (15-240), a type
+(work|study|personal|health|rest|ent), a priority, and optionally a soft preference
+for when as two 24-hour times like "14:00-17:00". Do not choose an exact start time --
+the scheduler decides that.
+
+If the message mentions nothing concrete, return an empty list.
+
+User message: {message}"""
+
+
 CLASSIFY_INSTRUCTIONS = """You are an intent classifier for a personal AI academic scheduler.
 Classify the user's latest message into exactly one intent:
 - "schedule_build": the user wants to build/generate/plan a schedule for a day or week (e.g. "schedule my day", "plan today", "what's my schedule").

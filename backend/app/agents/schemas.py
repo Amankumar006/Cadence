@@ -209,6 +209,54 @@ class ScheduleProposal(BaseModel):
     blocks: List[ScheduleBlock] = Field(default_factory=list)
 
 
+# ── Scheduling extraction: what to place, never when ────────────────────────
+
+
+class ExtraSchedulingItem(BaseModel):
+    """One flexible item the user mentioned that the deterministic rules miss.
+
+    The distinction from ``ScheduleBlock`` is the whole point of the split: this
+    carries *what* and *how long*, with an optional soft preference for when. It
+    deliberately has no ``time`` field, because the LLM is not allowed to decide
+    placement -- CP-SAT is, and it can enforce the no-overlap and buffer rules
+    that a language model cannot.
+    """
+
+    title: str = Field(description="Short human-readable name for the activity")
+    duration_min: int = Field(
+        default=60, ge=15, le=240, description="Realistic duration in minutes, 15-240"
+    )
+    type: str = Field(
+        default="work",
+        description="One of: work, study, personal, health, rest, ent",
+    )
+    priority: str = Field(
+        default="medium",
+        description="high | medium | low -- how much this matters if the day is full",
+    )
+    preferred_window: str = Field(
+        default="",
+        description=(
+            "Optional soft preference as two 24h times, e.g. '14:00-17:00'. "
+            "Leave empty for no preference. This is a hint, not a constraint."
+        ),
+    )
+    reason: str = Field(default="", description="Why this needs placing, one short phrase")
+
+
+class ExtraItems(BaseModel):
+    """Wrapper so the LLM returns an object rather than a bare array."""
+
+    items: List[ExtraSchedulingItem] = Field(default_factory=list)
+
+    @field_validator("items")
+    @classmethod
+    def _validate_items(cls, v):
+        # Drop anything unnameable -- a block with no title is unusable, and an
+        # empty list is the honest answer for a message that mentions nothing.
+        return [i for i in v if i.title.strip()]
+
+
 # ── Entity extraction from free text ───────────────────────────────────────
 
 

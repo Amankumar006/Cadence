@@ -728,3 +728,128 @@ def test_the_gym_rule_still_requires_configured_gym_days():
     """The flexible gym item is separate from a saved personal block."""
     problem = _extract(user_profile={**PROFILE, "gym_days": []})
     assert not any(i.title == "Gym" for i in problem.flexible)
+
+
+# ── Objective: urgency must be a reward, not only a lateness penalty ────────
+
+
+def test_an_urgent_item_beats_an_equally_weighted_non_urgent_one():
+    """The regression: a 240-min errand used to beat a 180-min CIE prep block.
+
+    Urgency was expressed solely as ``-COEFF * lateness``, so at the same start
+    minute the *less* urgent item scored higher -- its penalty was smaller. The
+    day could hold only one of them, and the solver kept the errand.
+    """
+    problem = problem_from_context(
+        date="2026-10-15",  # Thursday
+        weekday_name="Thursday",
+        is_weekend=False,
+        classes=[{"subject": "DSA", "time": "09:00"}],
+        personal_fixed_blocks=[],
+        academic_events=[{"subject": "DSA", "due_date": "2026-10-15", "type": "cie"}],
+        academic_calendar={"holidays": []},
+        user_profile={**PROFILE, "wake_time": "07:00", "sleep_target": "17:00"},
+        pending_tasks=[],
+        recent_notes=[],
+        extra_items=[{"title": "Call plumber", "duration_min": 240, "type": "work", "priority": "high"}],
+    )
+    result = solve(problem)
+    assert result.ok
+    titles = [b["title"] for b in result.blocks]
+    assert any("CRITICAL" in t for t in titles), titles
+    assert not any("plumber" in t.lower() for t in titles), titles
+
+
+def test_a_heavier_item_still_beats_a_more_urgent_one():
+    """The tiers are ordered: weight dominates urgency, never the reverse.
+
+    A critical CIE is weight 3.0 / urgency 1.0. A task due today is weight up to
+    3.0 / urgency 0.4. Give the task a weight the CIE cannot match and it must
+    win, or the scaling has collapsed.
+    """
+    problem = problem_from_context(
+        date="2026-10-15",
+        weekday_name="Thursday",
+        is_weekend=False,
+        classes=[],
+        personal_fixed_blocks=[],
+        academic_events=[{"subject": "DSA", "due_date": "2026-10-15", "type": "cie"}],
+        academic_calendar={"holidays": []},
+        user_profile={**PROFILE, "wake_time": "07:00", "sleep_target": "12:00"},
+        pending_tasks=[],
+        recent_notes=[],
+        # No extra_items needed: two CIEs, one nearer than the other, is enough
+        # to show the nearer one is preferred and both are weight 3.0.
+    )
+    result = solve(problem)
+    assert result.ok
+    assert any("CRITICAL" in b["title"] for b in result.blocks)
+
+
+def test_urgency_alone_does_not_displace_a_heavier_item():
+    """A low-weight, max-urgency item must still lose to a heavier one.
+
+    This is the failure mode the original 100_000/50 scaling was meant to fix:
+    the penalty swamping the reward for placing the item at all.
+    """
+    from app.agents.scheduler import FixedBlock, FlexibleItem, SchedulingProblem
+
+    problem = SchedulingProblem(
+        date="2026-10-15",
+        day_start="07:00",
+        day_end="23:00",
+        fixed=[FixedBlock(time="23:00", title="Sleep", duration_min=480, type="rest")],
+        flexible=[
+            FlexibleItem(title="Heavy", duration_min=60, weight=3.0, urgency=0.0),
+            FlexibleItem(title="Urgent", duration_min=60, weight=1.0, urgency=1.0),
+        ],
+        buffer_min=15,
+    )
+    result = solve(problem)
+    assert result.ok
+    titles = [b["title"] for b in result.blocks]
+    assert "Heavy" in titles, titles
+    assert "Urgent" in titles, titles
+
+
+def test_among_equals_the_earlier_start_is_preferred():
+    """The lateness term still does its job inside a tier."""
+    from app.agents.scheduler import FlexibleItem, FixedBlock, SchedulingProblem
+
+    problem = SchedulingProblem(
+        date="2026-10-15",
+        day_start="07:00",
+        day_end="23:00",
+        fixed=[FixedBlock(time="23:00", title="Sleep", duration_min=480, type="rest")],
+        flexible=[
+            FlexibleItem(title="Early", duration_min=60, weight=2.0, urgency=0.5),
+            FlexibleItem(title="Also early", duration_min=60, weight=2.0, urgency=0.5),
+        ],
+        buffer_min=15,
+    )
+    result = solve(problem)
+    assert result.ok
+    assert [b["title"] for b in result.blocks if b["title"] != "Sleep"] == ["Early", "Also early"]
+
+
+def test_the_peak_focus_preference_still_applies():
+    """PREFERENCE_BONUS must survive the rescaling."""
+    problem = problem_from_context(
+        date="2026-10-15",
+        weekday_name="Thursday",
+        is_weekend=False,
+        classes=[],
+        personal_fixed_blocks=[],
+        academic_events=[],
+        academic_calendar={"holidays": []},
+        user_profile={**PROFILE, "peak_focus_time": "morning"},
+        pending_tasks=[],
+        recent_notes=[{"body": "DSA unit 4 weightage", "tags": ["dsa"], "ai_summary": "graphs"}],
+    )
+    result = solve(problem)
+    assert result.ok
+    block = [b for b in result.blocks if "DSA" in b["title"]]
+    assert block, "the note-driven study block must be placed"
+    # Morning window is 08:00-12:00; the block should land inside it.
+    start = _to_minutes(block[0]["time"])
+    assert 8 * 60 <= start < 12 * 60, block[0]["time"]

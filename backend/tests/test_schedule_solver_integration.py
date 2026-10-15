@@ -306,3 +306,91 @@ async def test_the_fallback_helper_returns_the_shape_the_node_promises():
     assert out["needs_clarification"] is False
     assert isinstance(out["proposed_schedule"], list)
     assert any(b["title"] == "Sleep" for b in out["proposed_schedule"])
+
+
+# ── The LLM extraction half, end to end ─────────────────────────────────────
+
+
+async def test_an_item_from_the_users_message_reaches_the_solver(fake_llm, monkeypatch):
+    """The full split, exercised: the model says what, CP-SAT says when.
+
+    The user mentions a dentist appointment. No deterministic rule knows about
+    it. It must appear in the final schedule, at a time the solver chose, without
+    displacing the CIE prep block that IS in the rules.
+    """
+    from app.agents.schemas import ExtraItems, ExtraSchedulingItem
+    import app.context as ctx_mod
+    from tests.fakes import install_fake_firestore
+    from langgraph.store.memory import InMemoryStore
+
+    # Re-install the fake with a responder that answers the extraction call.
+    # Every other call in the node still gets None and degrades as usual.
+    fake_llm(
+        lambda p, s: ExtraItems(
+            items=[
+                ExtraSchedulingItem(
+                    title="Dentist appointment",
+                    duration_min=45,
+                    type="personal",
+                    priority="high",
+                    preferred_window="16:00-17:00",
+                )
+            ]
+        )
+    )
+
+    holder = install_fake_firestore(monkeypatch)
+    holder.db._data.update(
+        {
+            ("timetables", "u1"): {"Thursday": [{"subject": "DSA", "time": "09:00"}]},
+            ("academic_events", "u1", "items", "e1"): {
+                "title": "CIE DSA",
+                "subject": "DSA",
+                "due_date": TODAY_STR,
+                "completed": False,
+            },
+        }
+    )
+    monkeypatch.setattr(ctx_mod, "_db", holder.client)
+
+    state = {
+        "user_id": "u1",
+        "intent_date": TODAY_STR,
+        "messages": [
+            {"role": "user", "content": "schedule thursday, I have a dentist appointment at 4pm"}
+        ],
+    }
+    hydrated = await nodes.hydrate_context(state, InMemoryStore())
+    full = dict(state)
+    full.update(hydrated)
+    full["is_weekend"] = False
+    full["weekday_name"] = "Thursday"
+
+    blocks = await _run_build(full)
+    titles = [b["title"] for b in blocks]
+
+    assert "Dentist appointment" in titles, titles
+    assert any("CRITICAL" in t for t in titles), titles
+    assert "DSA" in titles, titles
+
+    # The solver, not the model, chose the time -- and it respected the hint.
+    dentist = [b for b in blocks if b["title"] == "Dentist appointment"][0]
+    assert _to_minutes(dentist["time"]) == 16 * 60, dentist["time"]
+
+    # And the result still verifies against the same problem the solver saw.
+    from app.agents.scheduler import problem_from_context, verify_candidate
+
+    problem = problem_from_context(
+        date=TODAY_STR,
+        weekday_name="Thursday",
+        is_weekend=False,
+        classes=full["timetable_today"]["classes"],
+        personal_fixed_blocks=[],
+        academic_events=full["academic_events"],
+        academic_calendar=full["academic_calendar"],
+        user_profile=full["user_profile"],
+        pending_tasks=full["pending_tasks"],
+        recent_notes=full["recent_notes"],
+        extra_items=await nodes.extract_extra_items(full),
+    )
+    assert verify_candidate(blocks, problem) == []

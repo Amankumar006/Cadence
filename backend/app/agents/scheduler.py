@@ -231,29 +231,48 @@ def solve(problem: SchedulingProblem, time_limit_s: float = 5.0) -> SolveResult:
     if intervals:
         model.AddNoOverlap(intervals)
 
-    # Objective. The scaling matters: weight must dominate, and urgency and the
-    # peak-focus preference must only ever break ties. An earlier version used
-    # weight*1000 with a -10/minute urgency penalty, which let the penalty
-    # exceed the reward for placing a high-weight item at all — the solver then
-    # correctly dropped the most urgent item, which is the opposite of intended.
-    # So: one unit of weight is worth 100000, and the largest possible urgency
-    # penalty (URGENCY_COEFF * 1440) stays below that.
-    WEIGHT_SCALE = 100_000
-    URGENCY_COEFF = 50
-    PREFERENCE_BONUS = 1_000
+    # Objective. The scaling matters, and the *shape* matters more.
+    #
+    # An earlier version expressed urgency purely as a penalty for starting late:
+    #     -URGENCY_COEFF * lateness
+    # That rewards earlier starts, which is what the comment claimed, but it says
+    # nothing about preferring an urgent item over a non-urgent one. Two items
+    # placed at the same minute score identically apart from the coefficient, so
+    # the *less* urgent item always wins the tie -- a 3.0-weight, 0.4-urgency
+    # errand beat a 3.0-weight, 1.0-urgency CIE prep block, because its penalty
+    # was smaller. Urgency has to be a positive term on its own.
+    #
+    # The tiers, each strictly larger than the maximum of the tier below it:
+    #   weight    1_000_000 per unit  -- dominates everything
+    #   urgency       10_000 per unit  -- breaks weight ties
+    #   lateness           1 per min   -- breaks urgency ties (max 1440)
+    #   preference       100 flat      -- the last tie-break
+    # The smallest gap between any two weights in use is 0.5 (500_000), which
+    # clears the urgency tier, so a higher-weight item is never displaced by a
+    # more urgent one.
+    WEIGHT_SCALE = 1_000_000
+    URGENCY_SCALE = 10_000
+    LATENESS_COEFF = 1
+    PREFERENCE_BONUS = 100
 
     objective = []
     for item, start, present in item_vars:
         objective.append(int(round(item.weight * WEIGHT_SCALE)) * present)
 
-        # Urgency: reward earlier starts. OR-Tools cannot multiply two
-        # variables, so the "start if placed, else 0" product is expressed as a
-        # bounded variable with an enforced equality.
+        # Urgency: an urgent item is worth more than a non-urgent one, full stop.
+        # This is the term that makes CIE prep beat an errand when the day can
+        # only hold one.
+        if item.urgency:
+            objective.append(int(round(item.urgency * URGENCY_SCALE)) * present)
+
+        # ...and among equally-weighted, equally-urgent items, prefer the earlier
+        # start. OR-Tools cannot multiply two variables, so "start if placed,
+        # else 0" is a bounded variable with an enforced equality.
         if item.urgency:
             lateness = model.NewIntVar(0, day_end, f"late_{len(objective)}")
             model.Add(lateness == start).OnlyEnforceIf(present)
             model.Add(lateness == 0).OnlyEnforceIf(present.Not())
-            objective.append(-int(round(item.urgency * URGENCY_COEFF)) * lateness)
+            objective.append(-LATENESS_COEFF * lateness)
 
         if item.preferred_start is not None and item.preferred_end is not None:
             # Soft preference for the peak-focus window: reward landing inside.
@@ -482,6 +501,7 @@ def problem_from_context(
     pending_tasks: Optional[Sequence[Dict[str, Any]]] = None,
     recent_notes: Optional[Sequence[Dict[str, Any]]] = None,
     movie_info: Optional[Dict[str, Any]] = None,
+    extra_items: Optional[Sequence[Dict[str, Any]]] = None,
     buffer_min: int = 15,
 ) -> SchedulingProblem:
     """Turn hydrated context into a SchedulingProblem.
@@ -490,6 +510,12 @@ def problem_from_context(
     constraints. It replaces the old rule-based builder, which both decided and
     placed. Keeping the decision here and the placement in CP-SAT is what makes
     the result verifiable.
+
+    ``extra_items`` comes from an LLM pass over the user's own message, for the
+    things the deterministic rules below cannot know about ("I have a group
+    project meeting", "need to call the plumber"). Every field it supplies is
+    clamped by _coerce_extra_item: the model chooses what and how long, never
+    when, and never more than the day can hold.
     """
     pending_tasks = pending_tasks or []
     recent_notes = recent_notes or []
@@ -684,7 +710,102 @@ def problem_from_context(
             )
         )
 
+    # ── Flexible: items the LLM found in the user's message ──
+    # Last, so anything it proposes sits below the deterministic study and task
+    # load. A day that is genuinely full should drop the user's ad-hoc request,
+    # not their CIE prep. Capped, so a chatty response cannot flood the solver.
+    kept = 0
+    for raw in extra_items or []:
+        if kept >= _EXTRA_MAX_ITEMS:
+            logger.debug(
+                "Dropping extra item %r: the %d-item cap is reached",
+                raw.get("title"),
+                _EXTRA_MAX_ITEMS,
+            )
+            break
+        item = _coerce_extra_item(raw, weekday_name)
+        if item is not None:
+            problem.flexible.append(item)
+            kept += 1
+
     return problem
+
+
+
+_EXTRA_PRIORITY_WEIGHT = {"high": 3.0, "medium": 2.0, "low": 1.0}
+_EXTRA_MAX_ITEMS = 4
+_EXTRA_TITLE_MAX = 60
+
+
+def _coerce_extra_item(raw: Dict[str, Any], weekday_name: str) -> Optional[FlexibleItem]:
+    """Turn one LLM-proposed item into a FlexibleItem, clamped hard.
+
+    The model is told to propose duration, type, priority and an optional
+    preference window. It is not trusted with any of them:
+
+    - duration is bounded to 15-240 minutes, so a hallucinated 600-minute block
+      cannot consume the whole day;
+    - at most ``_EXTRA_MAX_ITEMS`` are kept, so a chatty response cannot flood
+      the solver with noise;
+    - the preference window is parsed and, if malformed, ignored -- never fatal;
+    - weight is derived from priority only, so an inflated priority cannot
+      outrank a critical CIE.
+
+    Returns None when the item is unusable.
+    """
+    title = str(raw.get("title") or "").strip()[:_EXTRA_TITLE_MAX]
+    if not title:
+        return None
+
+    try:
+        duration = int(raw.get("duration_min") or 60)
+    except (TypeError, ValueError):
+        duration = 60
+    duration = max(15, min(240, duration))
+
+    btype = str(raw.get("type") or "work").strip().lower()
+    if btype not in BLOCK_TYPES:
+        btype = "work"
+
+    priority = str(raw.get("priority") or "medium").strip().lower()
+    if priority not in _EXTRA_PRIORITY_WEIGHT:
+        priority = "medium"
+
+    earliest, latest = _parse_preference(raw.get("preferred_window"))
+
+    reason = str(raw.get("reason") or "").strip()
+    notes = f"{title}." + (f" {reason}" if reason else "")
+
+    return FlexibleItem(
+        title=title,
+        duration_min=duration,
+        type=btype,
+        notes=notes,
+        weight=_EXTRA_PRIORITY_WEIGHT[priority],
+        urgency=0.4,
+        earliest=earliest,
+        latest=latest,
+    )
+
+
+def _parse_preference(value: Any) -> Tuple[Optional[int], Optional[int]]:
+    """Parse '14:00-17:00' into minutes, ignoring anything malformed.
+
+    A preference is a hint, so a parse failure yields (None, None) rather than
+    raising -- a malformed hint should cost the user a suboptimal placement, not
+    their schedule.
+    """
+    text = str(value or "").strip()
+    if not text or "-" not in text:
+        return None, None
+    parts = text.split("-", 1)
+    if len(parts) != 2:
+        return None, None
+    start = _to_minutes(parts[0].strip())
+    end = _to_minutes(parts[1].strip())
+    if start is None or end is None or start >= end:
+        return None, None
+    return start, end
 
 
 def _peak_window(peak: str) -> Tuple[Optional[int], Optional[int]]:

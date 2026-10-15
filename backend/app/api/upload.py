@@ -4,8 +4,11 @@ import logging
 import json
 import re
 import httpx
-from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Request
+from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form, Request
 from firebase_admin import firestore_async
+from app.agents.llm import ROUTER, astructured
+from app.agents.schemas import SyllabusLink
+from app.api.auth import get_current_user, resolve_user_id
 from app.config import settings
 
 logger = logging.getLogger("app.api.upload")
@@ -95,53 +98,46 @@ Note Content Preview: {note_content[:1500]}
 Available Syllabus:
 {syllabus_str}
 
-If the note is related to one of the subjects, choose the best matching subject, unit number (usually 1-indexed), and unit title from the syllabus.
-Return JSON only:
-{{
-  "subject": "subject name matching the syllabus subject",
-  "unit_number": number,
-  "unit_title": "unit title matching the syllabus unit title"
-}}
-If no match is found or there is no relevant unit, return null. Do not include markdown code blocks, just raw JSON or null."""
+If the note is related to one of the subjects, choose the best matching subject, unit number
+(usually 1-indexed), and unit title from the syllabus. If there is no match, leave the
+subject empty."""
 
-        text = await call_gemini_text(prompt)
-        text = text.strip()
-        if text.startswith("```"):
-            match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-            if match:
-                text = match.group(1).strip()
-                
-        if text.lower() == "null" or not text:
+        link = await astructured(prompt, SyllabusLink, tier=ROUTER, label="syllabus_link")
+        if link is None or not link.matched:
             return None
-            
-        match_data = json.loads(text)
-        if match_data and isinstance(match_data, dict):
-            subj_name = match_data.get("subject")
-            unit_num = match_data.get("unit_number")
-            if subj_name and unit_num:
-                # Update syllabus unit status if it was not_started
-                doc_ref = subjects_ref.document(subj_name)
-                doc = await doc_ref.get()
-                if doc.exists:
-                    subj_data = doc.to_dict() or {}
-                    units = subj_data.get("units", [])
-                    modified = False
-                    for u in units:
-                        if str(u.get("number")) == str(unit_num):
-                            if u.get("status") == "not_started" or not u.get("status"):
-                                u["status"] = "in_progress"
-                                modified = True
-                            break
-                    if modified:
-                        await doc_ref.set(subj_data, merge=True)
-                return match_data
+
+        match_data = {"subject": link.subject, "unit_number": link.unit_number, "unit_title": link.unit_title}
+        subj_name = match_data["subject"]
+        unit_num = match_data["unit_number"]
+        if subj_name and unit_num:
+            # Update syllabus unit status if it was not_started
+            doc_ref = subjects_ref.document(subj_name)
+            doc = await doc_ref.get()
+            if doc.exists:
+                subj_data = doc.to_dict() or {}
+                units = subj_data.get("units", [])
+                modified = False
+                for u in units:
+                    if str(u.get("number")) == str(unit_num):
+                        if u.get("status") == "not_started" or not u.get("status"):
+                            u["status"] = "in_progress"
+                            modified = True
+                        break
+                if modified:
+                    await doc_ref.set(subj_data, merge=True)
+            return match_data
         return None
     except Exception as e:
-        logger.error(f"Error linking note to syllabus: {e}", exc_info=True)
+        logger.error("Error linking note to syllabus: %s", e, exc_info=True)
         return None
 
 @router.post("/upload/timetable")
-async def upload_timetable(user_id: str = Form(...), file: UploadFile = File(...)):
+async def upload_timetable(
+    user_id: str = Form(default=""),
+    file: UploadFile = File(...),
+    verified_uid: str | None = Depends(get_current_user),
+):
+    user_id = resolve_user_id(verified_uid, user_id)
     if not user_id or not file:
         raise HTTPException(status_code=400, detail="Missing user_id or file")
         
@@ -193,7 +189,13 @@ Do not output any markdown code blocks, just raw JSON."""
         raise HTTPException(status_code=500, detail=f"Failed to parse timetable image: {str(e)}")
 
 @router.post("/upload/syllabus")
-async def upload_syllabus(user_id: str = Form(...), subject: str = Form(...), file: UploadFile = File(...)):
+async def upload_syllabus(
+    user_id: str = Form(default=""),
+    subject: str = Form(...),
+    file: UploadFile = File(...),
+    verified_uid: str | None = Depends(get_current_user),
+):
+    user_id = resolve_user_id(verified_uid, user_id)
     if not user_id or not file or not subject:
         raise HTTPException(status_code=400, detail="Missing user_id, subject, or file")
         
@@ -240,7 +242,12 @@ Do not output any markdown code blocks, just raw JSON."""
         raise HTTPException(status_code=500, detail=f"Failed to parse syllabus PDF: {str(e)}")
 
 @router.post("/upload/photo-note")
-async def upload_photo_note(user_id: str = Form(...), file: UploadFile = File(...)):
+async def upload_photo_note(
+    user_id: str = Form(default=""),
+    file: UploadFile = File(...),
+    verified_uid: str | None = Depends(get_current_user),
+):
+    user_id = resolve_user_id(verified_uid, user_id)
     if not user_id or not file:
         raise HTTPException(status_code=400, detail="Missing user_id or file")
 
@@ -288,7 +295,12 @@ Do not output any markdown code blocks, just raw JSON."""
         raise HTTPException(status_code=500, detail=f"Failed to parse photo note: {str(e)}")
 
 @router.post("/upload/audio-note")
-async def upload_audio_note(user_id: str = Form(...), file: UploadFile = File(...)):
+async def upload_audio_note(
+    user_id: str = Form(default=""),
+    file: UploadFile = File(...),
+    verified_uid: str | None = Depends(get_current_user),
+):
+    user_id = resolve_user_id(verified_uid, user_id)
     if not user_id or not file:
         raise HTTPException(status_code=400, detail="Missing user_id or file")
 
@@ -354,8 +366,12 @@ Do not output any markdown code blocks, just raw JSON."""
         raise HTTPException(status_code=500, detail=f"Failed to parse audio note: {str(e)}")
 
 @router.post("/upload/confirm/timetable")
-async def confirm_timetable(request: Request, body: dict):
-    user_id = body.get("user_id")
+async def confirm_timetable(
+    request: Request,
+    body: dict,
+    verified_uid: str | None = Depends(get_current_user),
+):
+    user_id = resolve_user_id(verified_uid, body.get("user_id"))
     timetable = body.get("timetable")
     
     if not user_id or not timetable:
@@ -387,8 +403,11 @@ async def confirm_timetable(request: Request, body: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/upload/confirm/syllabus")
-async def confirm_syllabus(body: dict):
-    user_id = body.get("user_id")
+async def confirm_syllabus(
+    body: dict,
+    verified_uid: str | None = Depends(get_current_user),
+):
+    user_id = resolve_user_id(verified_uid, body.get("user_id"))
     subject = body.get("subject")
     syllabus = body.get("syllabus")
     

@@ -16,6 +16,11 @@ langchain-openai==0.3.35
 httpx==0.28.1
 apscheduler==3.10.4
 python-multipart==0.0.32
+# Schedule solver: constraint programming. Placement is a
+# constraint-satisfaction problem, which LLMs are measurably bad
+# at (DCP-Bench, arXiv:2506.06052) and the rule-based builder got
+# wrong outright. See app/agents/scheduler.py.
+ortools==9.15.6755
 
 
 

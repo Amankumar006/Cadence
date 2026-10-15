@@ -8,8 +8,18 @@ mobile/ios/
 dist/
 build/
 
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
 # Secrets and environment configs
 agent-ad07f-firebase-adminsdk-fbsvc-c5b8d3b732.json
 backend/firebase-service-account.json
 .env
 .env.*
+!.env.example
+.neon

@@ -6,79 +6,117 @@ import re
 from typing import Any, Dict, List
 from langgraph.store.base import BaseStore
 from langchain_core.runnables import RunnableConfig
-from app.agents.llm import llm
-from app.config import settings
+from app.agents.llm import PLANNER, ROUTER, atext, astructured, bypass_llm
+from app.agents.schemas import (
+    IntentClassification,
+    NoteSummary,
+    ScheduleProposal,
+)
 from app.agents.state import AgentState
-from app.memory.store import load_user_profile, save_user_profile, sync_and_load_user_profile
+from app.config import settings
+from app.memory.store import save_user_profile, sync_and_load_user_profile
 from app.tools.memory import store_preference_func
-from app.tools.timetable import fetch_timetable_func
 from app.tools.calendar import write_calendar_func
 from app.tools.notifications import schedule_push_func, send_immediate_push
 from app.tools.tmdb import search_movies_func
 from app.agents.discovery import identify_missing_slots
-from app.agents.parser import parse_user_info
+from app.agents.schemas import ExtraItems
+from app.agents.prompts import EXTRA_ITEMS_PROMPT
+from app.context import load_chat_context, load_schedule_context
+from app.agents.parser import parse_due_date, parse_user_info
+from app.agents.scheduler import (
+    problem_from_context,
+    solve,
+    verify_candidate,
+)
+from app.agents.prompts import (
+    CHAT_INSTRUCTIONS,
+    CLASSIFY_INSTRUCTIONS,
+    SCHEDULE_OUTPUT_SHAPE,
+    SCHEDULE_ROLE,
+    SCHEDULE_RULES,
+    build_prompt,
+    log_prompt_shape,
+    section,
+)
 from firebase_admin import firestore_async
 
 logger = logging.getLogger("app.agents.nodes")
 
-async def summarize_note_content(body: str) -> dict:
-    """Uses LLM to summarize note content and extract subject + tags."""
-    logger.info(f"Summarizing note content: {body[:60]}...")
-    prompt = f"""Extract a 1-sentence summary, relevant subject, and 2-4 tags from this note.
-Note content: {body}
+async def summarize_note_content(body: str, user_id: str = None) -> dict:
+    """Uses the LLM to summarize note content and extract subject + tags.
 
-Return JSON only:
-{{
-  "summary": "1-sentence summary...",
-  "subject": "subject name or general category",
-  "tags": ["tag1", "tag2", ...]
-}}"""
-    try:
-        res = await llm.ainvoke(prompt)
-        text = res.content.strip()
-        if text.startswith("```"):
-            match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-            if match:
-                text = match.group(1).strip()
-        data = json.loads(text)
-        logger.info(f"Note summarized successfully: {data}")
-        return data
-    except Exception as e:
-        logger.error(f"Error in summarize_note_content LLM: {e}")
-        return {
-            "summary": body[:60] + "..." if len(body) > 60 else body,
-            "subject": "General",
-            "tags": ["general"]
-        }
+    Schema-constrained: the model cannot return malformed JSON, and the
+    fallback is deterministic. Never raises.
+    """
+    logger.info("Summarizing note content: %s...", (body or "")[:60])
+    prompt = f"""Extract a 1-sentence summary, the relevant subject, and 2-4 tags from this note.
+Note content: {body}"""
+    fallback = NoteSummary(
+        summary=(body[:60] + "...") if len(body) > 60 else body,
+        subject="General",
+        tags=["general"],
+    )
+    result = await astructured(
+        prompt, NoteSummary, user_id=user_id, fallback=fallback, tier=PLANNER, label="note_summary"
+    )
+    logger.info("Note summarized: subject=%s tags=%s", result.subject, result.tags)
+    return {"summary": result.summary, "subject": result.subject, "tags": result.tags}
+
 
 def parse_date_from_message(message: str) -> str:
-    msg = message.lower()
-    today = datetime.date.today()
-    
-    # Try to extract date matching YYYY-MM-DD
-    match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", message)
-    if match:
-        return match.group(1)
-        
-    if "today" in msg:
-        return today.isoformat()
-    if "tomorrow" in msg:
-        return (today + datetime.timedelta(days=1)).isoformat()
-    if "yesterday" in msg:
-        return (today - datetime.timedelta(days=1)).isoformat()
-        
-    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    for i, d in enumerate(days):
-        if d in msg:
-            # Find the next occurrence of this weekday
-            current_weekday = today.weekday()  # Monday is 0, Sunday is 6
-            target_weekday = i
-            days_ahead = target_weekday - current_weekday
-            if days_ahead <= 0: # target day already happened this week or is today
-                days_ahead += 7
-            return (today + datetime.timedelta(days=days_ahead)).isoformat()
-            
-    return today.isoformat() # Fallback to today
+    """Resolve a date mentioned in a message, defaulting to today.
+
+    Delegates to :func:`app.agents.parser.parse_due_date` so there is exactly
+    one date parser in the codebase.
+    """
+    parsed = parse_due_date(message)
+    return parsed or datetime.date.today().isoformat()
+
+
+def _classify_heuristically(message: str) -> tuple:
+    """Regex intent classification used for test users and LLM failure."""
+    last_msg_lower = (message or "").lower().strip()
+
+    # A question about existing data is a retrieval query, not new info.
+    is_query_for_info = any(
+        q in last_msg_lower
+        for q in [
+            "what", "when", "show", "give", "list", "check", "tell me",
+            "my monday", "my tuesday", "my wednesday", "my thursday",
+            "my friday", "my saturday", "my sunday", "my class", "my timetable",
+            "get my",
+        ]
+    )
+
+    if "arrived at" in last_msg_lower and any(
+        loc in last_msg_lower for loc in ["gym", "college", "library", "home"]
+    ):
+        return "location_trigger", "day"
+    if any(
+        kw in last_msg_lower
+        for kw in ["movie", "recommend", "watch", "film", "suggest", "binge", "entertainment"]
+    ):
+        return "entertainment_rec", "day"
+    if re.search(r"\b(edit|change|move|remove|add)\b", last_msg_lower):
+        return "schedule_edit", "day"
+    if not is_query_for_info and (
+        any(
+            kw in last_msg_lower
+            for kw in [
+                "cie", "exam", "assignment", "viva", "meditate", "workout", "unit",
+                "timetable", "time table", "schedule info", "study", "rvce", "bmsce",
+                "msrit", "bti", "vtu", "semester", "sem", "scheme", "buy", "task",
+                "todo", "reminder", "weightage", "note", "lab manual", "syllabus",
+                "class at", "routine", "deadline", "due",
+            ]
+        )
+        or last_msg_lower in ["no", "none", "nothing", "not yet", "no i don't", "no, thanks", "no thanks"]
+    ):
+        return "info_provided", "day"
+    if "schedule" in last_msg_lower or "today" in last_msg_lower:
+        return "schedule_build", "day"
+    return "general", "day"
 
 async def classify_intent(state: AgentState, store: BaseStore) -> Dict[str, Any]:
     """Classifies the user message into intent, scope, and date."""
@@ -104,75 +142,42 @@ async def classify_intent(state: AgentState, store: BaseStore) -> Dict[str, Any]
         if last_topic == "college":
             context_str += "\nCRITICAL: If the user provides a college name, abbreviation, or association (e.g. 'BTI', 'Bti', 'RVCE', 'BTI associated with vtu'), you MUST classify the 'intent' as 'info_provided'."
             
-    classify_prompt = f"""You are an intent classifier for a personal AI academic scheduler. {context_str}
-Classify the user's latest message into one of these intents:
-- "schedule_build": User wants to build/generate/plan a schedule for a day or week (e.g., "schedule my day", "plan today", "what's my schedule").
-- "schedule_edit": User wants to edit/change a proposed or existing schedule (e.g., "move gym to 7pm", "remove the study block").
-- "entertainment_rec": User wants movie, show, or entertainment recommendations.
-- "location_trigger": Automated geofence arrival messages (e.g., "arrived at gym", "arrived at college").
-- "info_provided": User is sharing/entering/providing NEW information to the system about their college name, course details, timetable, syllabus, academic events (CIE/SEE/viva/record), or personal routines (e.g., "I study at RVCE", "CIE-1 is on June 20", "I have a lab record due tomorrow", "I go to gym at 6pm daily", "I finished unit 2", "no", "none", "nothing this week", "Bti", "BTI associated with vtu"). IMPORTANT: This is only for inputting/saving new data.
-- "general": General chit-chat, greetings, or questions, including requests to view, retrieve, check, or show their existing classes, timetable, calendar, or tasks (e.g., "what are my classes on Monday", "show my timetable", "give my Monday college timetable", "hi", "how are you", "who are you").
-
-User Message: "{last_message}"
-
-Respond with ONLY a JSON object:
-{{
-  "intent": "schedule_build|schedule_edit|entertainment_rec|location_trigger|info_provided|general",
-  "scope": "day|week",
-  "date": "YYYY-MM-DD"
-}}
-Do not output any markdown code blocks, just raw JSON. If date cannot be parsed, use today's date: {datetime.date.today().isoformat()}"""
+    # Cache-friendly order: static instructions, then the discovery context,
+    # then the date, and the user message dead last (it is the only part that
+    # changes between two messages from the same user).
+    classify_prompt = build_prompt(
+        CLASSIFY_INSTRUCTIONS,
+        context_str,
+        f"Today's date: {datetime.date.today().isoformat()}",
+        f'User Message: "{last_message}"',
+    )
 
     intent = "general"
     intent_scope = "day"
     intent_date = datetime.date.today().isoformat()
-    
-    if user_id.startswith("test_"):
-        logger.info(f"Bypassing LLM classification for test user: {user_id}")
-        last_msg_lower = last_message.lower().strip()
-        is_query_for_info = any(q in last_msg_lower for q in ["what", "when", "show", "give", "list", "check", "my monday", "my tuesday", "my wednesday", "my thursday", "my friday", "my saturday", "my sunday", "my class", "my timetable", "get my", "tell me"])
-        
-        if "arrived at" in last_msg_lower and any(loc in last_msg_lower for loc in ["gym", "college", "library", "home"]):
-            intent = "location_trigger"
-        elif any(kw in last_msg_lower for kw in ["movie", "recommend", "watch", "film", "suggest", "binge", "entertainment"]):
-            intent = "entertainment_rec"
-        elif re.search(r"\b(edit|change|move|remove|add)\b", last_msg_lower):
-            intent = "schedule_edit"
-        elif not is_query_for_info and (any(kw in last_msg_lower for kw in ["cie", "exam", "assignment", "viva", "meditate", "workout", "unit", "timetable", "time table", "schedule info", "study", "rvce", "bmsce", "msrit", "bti", "vtu", "semester", "sem", "scheme", "buy", "task", "todo", "reminder", "weightage", "note", "lab manual"]) or last_msg_lower in ["no", "none", "nothing", "not yet", "no i don't", "no, thanks", "no thanks", "no"]):
-            intent = "info_provided"
-        elif "schedule" in last_msg_lower or "today" in last_msg_lower:
-            intent = "schedule_build"
+
+    if bypass_llm(user_id):
+        logger.info("Bypassing LLM classification for user: %s", user_id)
+        intent, intent_scope = _classify_heuristically(last_message)
         intent_date = parse_date_from_message(last_message)
     else:
-        try:
-            resp = await llm.ainvoke(classify_prompt)
-            text = resp.content.strip()
-            if text.startswith("```"):
-                match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-                if match:
-                    text = match.group(1).strip()
-            parsed = json.loads(text)
-            intent = parsed.get("intent", "general")
-            intent_scope = parsed.get("scope", "day")
-            intent_date = parsed.get("date") or parse_date_from_message(last_message)
-        except Exception as e:
-            logger.warning(f"Failed LLM classification, falling back to heuristics: {e}")
-            last_msg_lower = last_message.lower().strip()
-            is_query_for_info = any(q in last_msg_lower for q in ["what", "when", "show", "give", "list", "check", "my monday", "my tuesday", "my wednesday", "my thursday", "my friday", "my saturday", "my sunday", "my class", "my timetable", "get my", "tell me"])
-            
-            if "arrived at" in last_msg_lower and any(loc in last_msg_lower for loc in ["gym", "college", "library", "home"]):
-                intent = "location_trigger"
-            elif any(kw in last_msg_lower for kw in ["movie", "recommend", "watch", "film", "suggest", "binge", "entertainment"]):
-                intent = "entertainment_rec"
-            elif re.search(r"\b(edit|change|move|remove|add)\b", last_msg_lower):
-                intent = "schedule_edit"
-            elif not is_query_for_info and (any(kw in last_msg_lower for kw in ["cie", "exam", "assignment", "viva", "meditate", "workout", "unit", "timetable", "time table", "schedule info", "study", "rvce", "bmsce", "msrit", "bti", "vtu", "semester", "sem", "scheme", "buy", "task", "todo", "reminder", "weightage", "note", "lab manual"]) or last_msg_lower in ["no", "none", "nothing", "not yet", "no i don't", "no, thanks", "no thanks", "no"]):
-                intent = "info_provided"
-            elif "schedule" in last_msg_lower or "today" in last_msg_lower:
-                intent = "schedule_build"
+        parsed = await astructured(
+            classify_prompt,
+            IntentClassification,
+            user_id=user_id,
+            tier=ROUTER,
+            label="intent",
+        )
+        if parsed is None:
+            logger.warning("Classification failed; using heuristic fallback")
+            intent, intent_scope = _classify_heuristically(last_message)
             intent_date = parse_date_from_message(last_message)
-        
-    logger.info(f"Classified intent: {intent}, date: {intent_date}")
+        else:
+            intent = parsed.intent
+            intent_scope = parsed.scope
+            intent_date = parsed.date or parse_date_from_message(last_message)
+
+    logger.info("Classified intent: %s, scope: %s, date: %s", intent, intent_scope, intent_date)
     return {
         "intent": intent,
         "intent_scope": intent_scope,
@@ -358,7 +363,7 @@ async def save_parsed_info(user_id: str, parsed: dict, store: BaseStore) -> str:
         
     elif info_type == "note":
         note_body = info_data.get("body") or parsed.get("message", "")
-        summary_data = await summarize_note_content(note_body)
+        summary_data = await summarize_note_content(note_body, user_id=user_id)
         note_ref = db.collection("notes").document(user_id).collection("items")
         await note_ref.add({
             "title": info_data.get("title") or summary_data.get("subject") or "Note",
@@ -412,18 +417,13 @@ async def hydrate_context(state: AgentState, store: BaseStore) -> Dict[str, Any]
     user_profile = await sync_and_load_user_profile(store, user_id)
     
     messages = state.get("messages", [])
-    last_user_msg = ""
-    last_assistant_msg = ""
-    
-    if len(messages) >= 1:
-        last_user_msg = messages[-1].content if hasattr(messages[-1], "content") else (messages[-1].get("content", "") if isinstance(messages[-1], dict) else "")
-    if len(messages) >= 2:
-        for m in reversed(messages[:-1]):
-            role = getattr(m, "type", "human")
-            content = m.content if hasattr(m, "content") else (m.get("content", "") if isinstance(m, dict) else "")
-            if role == "ai" or role == "assistant" or (isinstance(m, dict) and m.get("role") == "assistant"):
-                last_assistant_msg = content
-                break
+    last_user_msg = (
+        messages[-1].content
+        if hasattr(messages[-1], "content")
+        else (messages[-1].get("content", "") if isinstance(messages[-1], dict) else "")
+        if messages
+        else ""
+    )
 
     # If the last message provided information, parse it
     if last_user_msg:
@@ -436,129 +436,28 @@ async def hydrate_context(state: AgentState, store: BaseStore) -> Dict[str, Any]
         except Exception as parse_err:
             logger.warning(f"Failed parsing inline user message: {parse_err}")
 
-    # 2. Fetch timetable, academic events, personal schedule, calendar, and notes in parallel
-    db = firestore_async.client()
-    
-    timetable_task = fetch_timetable_func(user_id=user_id, date=date)
-    tasks_task = db.collection("tasks").document(user_id).collection("items").get()
-    events_task = db.collection("academic_events").document(user_id).collection("items").get()
-    personal_task = db.collection("personal_schedule").document(user_id).get()
-    calendar_task = db.collection("academic_calendar").document(user_id).get()
-    notes_task = db.collection("notes").document(user_id).collection("items").get()
-    
-    timetable_res, tasks_snap, events_snap, personal_doc, calendar_doc, notes_snap = await asyncio.gather(
-        timetable_task,
-        tasks_task,
-        events_task,
-        personal_task,
-        calendar_task,
-        notes_task
-    )
-    
-    # Process tasks
-    tasks = []
-    for doc in tasks_snap:
-        tdata = doc.to_dict()
-        if not tdata.get("completed", False):
-            tdata["id"] = doc.id
-            tasks.append(tdata)
-            
-    classes = timetable_res.get("classes") or []
-    weekday = timetable_res.get("weekday", "")
-    timetable_today = {"classes": classes, "weekday": weekday}
-    
-    # Filter academic events: due within 14 days and completed=false, sorted by due_date
-    academic_events = []
-    dt_today = datetime.date.fromisoformat(date)
-    for doc in events_snap:
-        event_data = doc.to_dict()
-        event_data["id"] = doc.id
-        if not event_data.get("completed", False):
-            due_date_str = event_data.get("due_date")
-            if due_date_str:
-                try:
-                    dt_due = datetime.date.fromisoformat(due_date_str)
-                    days_remaining = (dt_due - dt_today).days
-                    if 0 <= days_remaining <= 14:
-                        event_data["days_remaining"] = days_remaining
-                        academic_events.append(event_data)
-                except ValueError:
-                    pass
-    academic_events.sort(key=lambda x: x.get("due_date", "9999-12-31"))
-    
-    # Personal fixed blocks
-    personal_fixed_blocks = (personal_doc.to_dict() or {}).get("fixed_blocks", []) if personal_doc.exists else []
-    
-    # Academic calendar
-    academic_calendar = calendar_doc.to_dict() or {} if calendar_doc.exists else {}
-
-    # Fetch syllabus status in parallel for subjects with upcoming events
-    syllabus_status = {}
-    subjects_due_soon = set()
-    for event in academic_events:
-        sub = event.get("subject")
-        if sub and sub.lower() != "all":
-            subjects_due_soon.add(sub)
-                
-    async def fetch_subject_syllabus(subj):
-        try:
-            doc = await db.collection("syllabus").document(user_id).collection("subjects").document(subj).get()
-            if doc.exists:
-                return subj, doc.to_dict()
-        except Exception as e:
-            logger.error(f"Error fetching syllabus for {subj}: {e}")
-        return subj, None
-
-    if subjects_due_soon:
-        syllabus_results = await asyncio.gather(*(fetch_subject_syllabus(s) for s in subjects_due_soon))
-        for subj, syl_data in syllabus_results:
-            if syl_data:
-                syllabus_status[subj] = syl_data
+    # 2. Everything the solver needs, via the typed loaders in app.context.
+    #    Those own the filtering rules (14-day event horizon, 7-day note
+    #    freshness, syllabus only for subjects with something due) so the same
+    #    rules are not re-derived in general_chat and save_user_info_node.
+    ctx = await load_schedule_context(user_id, date)
 
     college_info = state.get("college_info")
     if college_info is None:
         college_info = user_profile.get("college_info") or {}
-        
+
     calendar_status = state.get("calendar_status")
     if calendar_status is None:
         calendar_status = user_profile.get("calendar_status") or "unknown"
-        
-    # Process recent notes (last 7 days)
-    recent_notes = []
-    dt_today = datetime.date.fromisoformat(date)
-    dt_7_days_ago = dt_today - datetime.timedelta(days=7)
-    for doc in notes_snap:
-        ndata = doc.to_dict()
-        ndata["id"] = doc.id
-        created_at_str = ndata.get("created_at")
-        is_recent = True
-        if created_at_str:
-            try:
-                dt_created = datetime.datetime.fromisoformat(created_at_str.replace("Z", "+00:00")).date()
-                if dt_created < dt_7_days_ago:
-                    is_recent = False
-            except Exception:
-                pass
-        if is_recent:
-            if "type" not in ndata:
-                ndata["type"] = "text"
-            recent_notes.append(ndata)
 
     # Bypassed guided discovery loop in hydrate_context (handled in check_clarification_node)
     return {
         "user_profile": user_profile,
-        "timetable_today": timetable_today,
-        "task_queue": tasks,
-        "pending_tasks": tasks,
-        "recent_notes": recent_notes,
-        "academic_events": academic_events,
-        "personal_fixed_blocks": personal_fixed_blocks,
-        "syllabus_status": syllabus_status,
+        **ctx,
         "needs_clarification": False,
         "clarification_question": None,
         "college_info": college_info,
         "calendar_status": calendar_status,
-        "academic_calendar": academic_calendar
     }
 
 async def ask_clarification(state: AgentState, store: BaseStore) -> Dict[str, Any]:
@@ -569,6 +468,33 @@ async def ask_clarification(state: AgentState, store: BaseStore) -> Dict[str, An
         "messages": [{"role": "assistant", "content": question}],
         "needs_clarification": False  # Reset flag once asked
     }
+
+def merge_solver_and_model_blocks(solved_blocks, model_blocks):
+    """Overlay the model's notes onto the solver's placement.
+
+    The solver owns *when* things happen; the model owns *what to say* about
+    them. Taking the model's times would reintroduce the overlap bug this whole
+    module exists to remove, so times are matched by title and the solver's are
+    always kept. Blocks the model did not mention keep their solver notes.
+    """
+    notes_by_title = {}
+    for block in model_blocks or []:
+        title = getattr(block, "title", None) or (block.get("title") if isinstance(block, dict) else None)
+        notes = getattr(block, "notes", None)
+        if notes is None and isinstance(block, dict):
+            notes = block.get("notes")
+        if title and notes:
+            notes_by_title[str(title)] = str(notes)
+
+    merged = []
+    for block in solved_blocks:
+        new_block = dict(block)
+        model_notes = notes_by_title.get(str(block.get("title", "")))
+        if model_notes:
+            new_block["notes"] = model_notes
+        merged.append(new_block)
+    return merged
+
 
 def generate_rule_based_schedule(
     user_id: str,
@@ -720,6 +646,88 @@ def generate_rule_based_schedule(
     })
     
     return blocks
+
+def _fallback_schedule(scope: Dict[str, Any]) -> Dict[str, Any]:
+    """Last-resort schedule when CP-SAT cannot solve or verification fails.
+
+    Both the solve-failure and the verify-failure branch used to repeat this
+    call verbatim, so adding a field meant editing two blocks. ``locals()`` of
+    the caller is passed rather than twelve named arguments.
+
+    This is the path that produced the overlapping-blocks bug: it hardcodes
+    times and never checks for conflicts. It exists so a solver failure is a
+    degraded day rather than an error page, which is why every branch here logs
+    at error level first.
+    """
+    return {
+        "proposed_schedule": generate_rule_based_schedule(
+            user_id=scope["user_id"],
+            date=scope["date"],
+            weekday_name=scope["weekday_name"],
+            is_weekend=scope["is_weekend"],
+            classes=scope["classes"],
+            personal_fixed_blocks=scope["personal_fixed_blocks"],
+            academic_events=scope["academic_events"],
+            academic_calendar=scope["academic_calendar"],
+            user_profile=scope["user_profile"],
+            pending_tasks=scope["pending_tasks"],
+            recent_notes=scope["recent_notes"],
+        ),
+        "needs_clarification": False,
+    }
+
+
+async def extract_extra_items(state: AgentState) -> List[Dict[str, Any]]:
+    """Ask the LLM what the user mentioned that the deterministic rules miss.
+
+    The deterministic rules in problem_from_context know about classes, CIEs,
+    tasks due today, gym days, the movie mandate and note-driven study. They
+    cannot know that the user just said "I have a group project meeting after
+    lunch" or "need to call the plumber".
+
+    This is the one place the model is allowed to add work, and it is bounded:
+    ExtraSchedulingItem has no `time` field at all, so it cannot place anything.
+    It proposes what, how long, and at most a soft window; problem_from_context
+    clamps every field and _coerce_extra_item drops anything unusable.
+
+    Returns [] on any failure. An empty list means "only the deterministic
+    rules", which is a perfectly good schedule -- it just is not this one.
+    """
+    messages = state.get("messages") or []
+    if not messages:
+        return []
+
+    last = messages[-1]
+    text = (
+        getattr(last, "content", None)
+        if not isinstance(last, dict)
+        else last.get("content", "")
+    )
+    text = str(text or "").strip()
+    if not text:
+        return []
+
+    # Nothing to extract from a bare approval or a short command. This also
+    # keeps the cache-friendly prompt shape: the extraction call is skipped
+    # entirely for the common "schedule my day" turn.
+    if len(text) < 25:
+        return []
+
+    try:
+        parsed = await astructured(
+            EXTRA_ITEMS_PROMPT.format(message=text),
+            ExtraItems,
+            user_id=state.get("user_id"),
+        )
+    except Exception as err:
+        logger.warning("Extra-item extraction failed (%s); using deterministic rules only", err)
+        return []
+
+    if parsed is None:
+        return []
+
+    return [item.model_dump() for item in parsed.items]
+
 
 async def build_schedule(state: AgentState) -> Dict[str, Any]:
     """Generates the proposed schedule based on timetable, profile, and tasks."""
@@ -893,6 +901,7 @@ async def build_schedule(state: AgentState) -> Dict[str, Any]:
  
     # ── Saturday Movie Night TMDB Recommendation ──
     movie_info_str = ""
+    movie_info = None
     if weekday_name.lower() == "saturday":
         try:
             logger.info("Today is Saturday. Fetching TMDB recommendation for schedule block...")
@@ -911,6 +920,11 @@ async def build_schedule(state: AgentState) -> Dict[str, Any]:
                 movie_title = top_movie.get("title", "Curated Movie")
                 movie_rating = top_movie.get("rating", "7.0")
                 movie_overview = top_movie.get("overview", "A special movie pick for you.")
+                movie_info = {
+                    "title": movie_title,
+                    "rating": movie_rating,
+                    "overview": movie_overview,
+                }
                 movie_info_str = f"\n🎥 SATURDAY MOVIE NIGHT MANDATE:\nYou MUST schedule a movie block at exactly 21:30 titled 'Movie Night: {movie_title}' (type: ent, duration: 120 min) with notes: '⭐ {movie_rating}/10 - {movie_overview[:120]}...'"
                 logger.info(f"Top Saturday movie found: {movie_title}")
             else:
@@ -949,186 +963,143 @@ async def build_schedule(state: AgentState) -> Dict[str, Any]:
     else:
         feedback_str = "No previous feedback."
         
-    # Format the SCHEDULE_PROMPT
-    prompt = f"""You are a personal AI scheduler. Build a realistic, personalized schedule for {date} ({weekday_name}).
- 
-═══════════════════════════════════════════
-FIXED CLASSES — DO NOT MOVE OR REMOVE
-═══════════════════════════════════════════
-{timetable_classes}
-{movie_info_str}
- 
-═══════════════════════════════════════════
-PERSONAL FIXED BLOCKS — NON-NEGOTIABLE
-(treat exactly like college classes, never move)
-═══════════════════════════════════════════
-{non_negotiable_str}
- 
-═══════════════════════════════════════════
-PERSONAL FLEXIBLE BLOCKS — schedule if space allows
-═══════════════════════════════════════════
-{flexible_str}
- 
-═══════════════════════════════════════════
-PENDING TASKS DUE SOON
-═══════════════════════════════════════════
-{pending_tasks_str}
- 
-═══════════════════════════════════════════
-RECENT NOTES CONTEXT
-═══════════════════════════════════════════
-{recent_notes_str}
- 
-═══════════════════════════════════════════
-ACADEMIC EVENTS DUE SOON
-═══════════════════════════════════════════
-{academic_events_str}
- 
-═══════════════════════════════════════════
-ACADEMIC CALENDAR
-═══════════════════════════════════════════
-CIE dates: {json.dumps(cie_dates)}
-SEE starts: {see_start}
-Next holiday: {next_holiday}
- 
-═══════════════════════════════════════════
-SYLLABUS RISK ASSESSMENT
-═══════════════════════════════════════════
-{risk_assessment_str}
- 
-═══════════════════════════════════════════
-USER PROFILE
-═══════════════════════════════════════════
-Role: {role}
+    # Assemble the prompt in implicit-cache order: static instructions and the
+    # output shape first (identical on every request), then stable profile
+    # context, then day-specific context, and the volatile date/feedback last.
+    # Gemini caches the prefix, so a date in the opening line would disable
+    # caching entirely. See app/agents/prompts.py.
+    prompt = build_prompt(
+        SCHEDULE_ROLE,
+        SCHEDULE_RULES,
+        SCHEDULE_OUTPUT_SHAPE,
+        section(
+            "USER PROFILE",
+            f"""Role: {role}
 Wake time target: {wake_time} (actual avg: {actual_wake_avg})
 Sleep target: {sleep_target}
 Peak focus time: {peak_focus_time}
 Study block length: {study_block_pref}
 Gym days: {gym_days} at {gym_time}
-Mode: {current_mode}
- 
-═══════════════════════════════════════════
-BEHAVIORAL PATTERNS (learned)
-═══════════════════════════════════════════
-{patterns_str}
-Example: gym_monday: 0.8 means they skip gym 80% of Mondays — don't schedule gym today if it's Monday.
- 
-═══════════════════════════════════════════
-USER FEEDBACK ON PREVIOUS PROPOSAL
-═══════════════════════════════════════════
-{feedback_str}
-(Apply these edits exactly. If empty, ignore.)
- 
-═══════════════════════════════════════════
-RULES
-═══════════════════════════════════════════
-1. Never schedule two blocks at the same time.
-2. Never schedule over non-negotiable personal blocks. They must remain exactly at their fixed time.
-3. Add 15-min buffer before every Fixed Class or Non-Negotiable Personal Block for preparation/commute.
-4. Prioritize tasks by deadline proximity, not just priority label.
-5. Never schedule deep study within 30 min of a meal.
-6. If today is a gym day AND skip_probability < 0.6, include gym. If skip_probability > 0.6, either omit it or append '(you often skip this)' to the block's notes.
-7. In weekend mode, on Saturdays you must include the Saturday movie night block at exactly 21:30.
-8. Always end with a sleep block at sleep_target.
-9. Apply these Scheduling Rules for Academic Events (THESE MANDATORILY OVERRIDE GENERAL PREFERENCES SUCH AS STUDY BLOCK LENGTH):
-   - CIE within 7 days → You MUST add a 2hr (120 min) study block daily for that subject.
-   - CIE within 3 days → You MUST add a 3hr (180 min) study block daily for that subject (do NOT split it, and do NOT use the user's standard 90 min preference). The block's notes or title MUST contain the word "CRITICAL" and the phrase "CIE prep (CRITICAL)".
-   - Lab record due tomorrow → You MUST add a 1.5hr (90 min) lab writing block this evening (post 17:00).
-   - Assignment due tomorrow → You MUST add a 1.5hr (90 min) study block today to complete it, and mark the notes or title as "Urgent".
-   - SEE within 14 days → You MUST restructure the entire day's schedule to focus heavily on revision.
- 
-Return ONLY a JSON array. No markdown, no explanation:
-[
-  {{
-    "time": "HH:MM",
-    "title": "Block title",
-    "type": "work|study|personal|health|rest|ent",
-    "duration_min": 60,
-    "notes": "Context or reminder text shown to user"
-  }}
-]
-"""
+Mode: {current_mode}""",
+        ),
+        section(
+            "BEHAVIORAL PATTERNS (learned)",
+            patterns_str,
+            "gym_monday: 0.8 means they skip gym 80% of Mondays - don't schedule gym today if it's Monday.",
+        ),
+        section("FIXED CLASSES", timetable_classes, "DO NOT MOVE OR REMOVE"),
+        section(
+            "PERSONAL FIXED BLOCKS",
+            non_negotiable_str,
+            "treat exactly like college classes, never move",
+        ),
+        section(
+            "PERSONAL FLEXIBLE BLOCKS",
+            flexible_str,
+            "schedule if space allows",
+        ),
+        section("ACADEMIC EVENTS DUE SOON", academic_events_str),
+        section(
+            "ACADEMIC CALENDAR",
+            f"""CIE dates: {json.dumps(cie_dates)}
+SEE starts: {see_start}
+Next holiday: {next_holiday}""",
+        ),
+        section("SYLLABUS RISK ASSESSMENT", risk_assessment_str),
+        section("PENDING TASKS DUE SOON", pending_tasks_str),
+        section("RECENT NOTES CONTEXT", recent_notes_str),
+        movie_info_str,
+        section(
+            "USER FEEDBACK ON PREVIOUS PROPOSAL",
+            feedback_str,
+            "Apply these edits exactly. If empty, ignore.",
+        ),
+        # Volatile last: this line is the only part that changes between two
+        # runs for the same user on different days.
+        f"Build the schedule for {date} ({weekday_name}).",
+    )
 
-    logger.info(f"Generated schedule prompt for date: {date}")
-    
-    proposed_schedule = None
-    
-    # 1. Bypass LLM for test users to avoid API rate limit depletion during automated runs
-    if user_id.startswith("test_"):
-        logger.info(f"Bypassing LLM call for test user: {user_id}")
-        proposed_schedule = generate_rule_based_schedule(
-            user_id=user_id,
-            date=date,
-            weekday_name=weekday_name,
-            is_weekend=is_weekend,
-            classes=classes,
-            personal_fixed_blocks=personal_fixed_blocks,
-            academic_events=academic_events,
-            academic_calendar=academic_calendar,
-            user_profile=user_profile,
-            pending_tasks=pending_tasks,
-            recent_notes=recent_notes
+    logger.info("Generated schedule prompt for date: %s", date)
+
+    # 3a. What did the user just say that the deterministic rules cannot see?
+    extra_items = await extract_extra_items(state)
+    if extra_items:
+        logger.info("Extracted %d extra item(s) from the user message", len(extra_items))
+
+    # 3b. Extract the scheduling problem, then solve it with CP-SAT.
+    #
+    # The split matters. Deciding *what* needs placing and with what constraints
+    # is an extraction job the LLM is good at; placing it without overlaps is
+    # constraint satisfaction, which LLMs are measurably bad at and which the
+    # old rule-based builder got wrong outright (it emitted a hardcoded 15:00
+    # block per critical CIE, so two exams inside three days collided).
+    problem = problem_from_context(
+        date=date,
+        weekday_name=weekday_name,
+        is_weekend=is_weekend,
+        classes=classes,
+        personal_fixed_blocks=personal_fixed_blocks,
+        academic_events=academic_events,
+        academic_calendar=academic_calendar,
+        user_profile=user_profile,
+        pending_tasks=pending_tasks,
+        recent_notes=recent_notes,
+        movie_info=movie_info,
+        extra_items=extra_items,
+    )
+
+    result = solve(problem)
+    if not result.ok:
+        logger.error(
+            "CP-SAT could not solve the schedule (%s); using fallback", result.status
         )
-    else:
-        # Call the LLM fallback chain
-        response_content = ""
-        last_err = None
+        return _fallback_schedule(locals())
+
+    proposed_schedule = result.blocks
+
+    # 4. Verify independently of the solver, then let the LLM annotate.
+    #
+    # verify_candidate re-derives every hard constraint from the problem rather
+    # than trusting the solver, so a solver bug cannot mark its own homework. A
+    # failure here means we do NOT show the user the schedule.
+    violations = verify_candidate(proposed_schedule, problem)
+    if violations:
+        logger.error(
+            "Solved schedule failed verification (%d violations: %s); using fallback",
+            len(violations),
+            "; ".join(v.code for v in violations[:5]),
+        )
+        return _fallback_schedule(locals())
+
+    logger.info(
+        "Solved schedule for %s: %d blocks in %.3fs (%s), dropped %s",
+        date,
+        len(proposed_schedule),
+        result.solver_time_s,
+        result.status,
+        result.dropped or "nothing",
+    )
+
+    # 5. The LLM's remaining job is to write the notes for each block — a
+    # writing task, not a planning one. If it fails, the solved schedule stands
+    # on its own with the notes the solver already attached.
+    if not bypass_llm(user_id):
         try:
-            logger.info("Calling LLM fallback chain...")
-            resp = await llm.ainvoke(prompt)
-            response_content = resp.content
-        except Exception as e:
-            logger.error(f"Error calling LLM fallback chain: {e}")
-            last_err = e
-            
-        if not response_content:
-            logger.error(f"All LLM models failed. Building rule-based fallback. Last error: {last_err}")
-            proposed_schedule = generate_rule_based_schedule(
+            log_prompt_shape("schedule", prompt, settings.PRIMARY_MODEL)
+            annotated = await astructured(
+                prompt,
+                ScheduleProposal,
                 user_id=user_id,
-                date=date,
-                weekday_name=weekday_name,
-                is_weekend=is_weekend,
-                classes=classes,
-                personal_fixed_blocks=personal_fixed_blocks,
-                academic_events=academic_events,
-                academic_calendar=academic_calendar,
-                user_profile=user_profile,
-                pending_tasks=pending_tasks,
-                recent_notes=recent_notes
+                tier=PLANNER,
+                label="schedule_notes",
             )
-        else:
-            # Normalise response_content: gemini-flash-latest returns a list of content parts
-            if isinstance(response_content, list):
-                response_content = " ".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in response_content
-                ).strip()
-                
-            # Parse the JSON response
-            try:
-                text = response_content.strip()
-                if text.startswith("```"):
-                    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-                    if match:
-                        text = match.group(1).strip()
-                proposed_schedule = json.loads(text)
-                logger.info(f"Successfully parsed proposed schedule with {len(proposed_schedule)} blocks.")
-            except Exception as parse_err:
-                logger.error(f"Failed to parse JSON schedule response: {parse_err}. Content: {response_content[:200]}")
-                proposed_schedule = generate_rule_based_schedule(
-                    user_id=user_id,
-                    date=date,
-                    weekday_name=weekday_name,
-                    is_weekend=is_weekend,
-                    classes=classes,
-                    personal_fixed_blocks=personal_fixed_blocks,
-                    academic_events=academic_events,
-                    academic_calendar=academic_calendar,
-                    user_profile=user_profile,
-                    pending_tasks=pending_tasks,
-                    recent_notes=recent_notes
+            if annotated is not None and annotated.blocks:
+                proposed_schedule = merge_solver_and_model_blocks(
+                    proposed_schedule, annotated.blocks
                 )
-            
+        except Exception as annotate_err:
+            logger.warning("LLM annotation failed; keeping solver output: %s", annotate_err)
+
     return {
         "proposed_schedule": proposed_schedule,
         "needs_clarification": False
@@ -1184,31 +1155,23 @@ async def general_chat(state: AgentState, store: BaseStore) -> Dict[str, Any]:
     user_id = state.get("user_id", "default_user")
     date = state.get("intent_date") or datetime.date.today().isoformat()
     
-    # Load user profile, timetable, and pending tasks in parallel
-    user_profile = {}
-    classes = []
+    # Chat answers questions about today, so it needs today's classes, the
+    # events and the task list. The full schedule context also loads the
+    # academic calendar, recent notes and a syllabus read per due subject --
+    # four extra round trips to answer "what's on today?".
+    user_profile: Dict[str, Any] = {}
+    classes: List[Dict[str, Any]] = []
     weekday = "today"
-    academic_events = []
-    tasks = []
-    
+    academic_events: List[Dict[str, Any]] = []
+    tasks: List[Dict[str, Any]] = []
+
     try:
+        chat_ctx = await load_chat_context(user_id, date)
         user_profile = await sync_and_load_user_profile(store, user_id)
-        db = firestore_async.client()
-        
-        schedule_info, task_queue = await asyncio.gather(
-            fetch_timetable_func(user_id=user_id, date=date),
-            db.collection("tasks").document(user_id).collection("items").get()
-        )
-        
-        classes = schedule_info.get("classes") or []
-        weekday = schedule_info.get("weekday", "today")
-        academic_events = schedule_info.get("academic_events") or []
-        
-        for doc in task_queue:
-            tdata = doc.to_dict()
-            if not tdata.get("completed", False):
-                tdata["id"] = doc.id
-                tasks.append(tdata)
+        classes = chat_ctx["timetable_today"]["classes"]
+        weekday = chat_ctx["timetable_today"]["weekday"] or "today"
+        academic_events = chat_ctx["academic_events"]
+        tasks = chat_ctx["task_queue"]
     except Exception as gather_err:
         logger.warning(f"general_chat failed to gather database context: {gather_err}")
 
@@ -1235,43 +1198,28 @@ async def general_chat(state: AgentState, store: BaseStore) -> Dict[str, Any]:
             history_parts.append(f"{role}: {m.get('content', '')}")
     
     conversation = "\n".join(history_parts) or "User: Hello"
+    last_user_msg = messages[-1].content if messages and hasattr(messages[-1], "content") else "Hello"
     
-    chat_prompt = f"""You are a helpful personal AI assistant for students and working professionals.
-You help with scheduling, studying, and productivity. Be concise, friendly, and helpful.
+    # Cache-friendly order: static instructions, then context blocks, then the
+    # conversation, with the latest user message dead last. It is the only part
+    # that changes between two messages from the same user.
+    chat_prompt = build_prompt(
+        CHAT_INSTRUCTIONS,
+        section("USER PROFILE", profile_summary),
+        section(f"TIMETABLE TODAY ({weekday})", classes_summary),
+        section("ACADEMIC EVENTS", events_summary),
+        section("PENDING TASKS", tasks_summary),
+        f"Conversation so far:\n{conversation}",
+        f"Latest user message: {last_user_msg}",
+    )
 
-User Context:
-- User ID: {user_id}
-- Current Date/Query Date: {date} ({weekday})
-- User Profile: {profile_summary}
-- College Timetable for {weekday}:
-{classes_summary}
-- Academic Events:
-{events_summary}
-- Pending Tasks:
-{tasks_summary}
-
-Conversation so far:
-{conversation}
-
-Respond to the latest user message. If the user is asking about their classes, timetable, exams, or tasks, use the provided context to answer accurately. If they haven't uploaded a timetable/syllabus but are asking about it, guide them on how to upload a photo/document in the Academics tab."""
-    
-    # Try calling LLM for chat response
-    response_text = "I'm here to help you plan your day and stay productive! Try saying 'schedule my day' to get started."
-    try:
-        if user_id.startswith("test_"):
-            raise ValueError("Bypassing LLM call for test user.")
-        resp = await llm.ainvoke(chat_prompt)
-        raw = resp.content
-        if isinstance(raw, list):
-            # Extract text from list of content parts
-            response_text = " ".join(
-                part.get("text", "") if isinstance(part, dict) else str(part)
-                for part in raw
-            ).strip()
-        elif isinstance(raw, str):
-            response_text = raw.strip()
-    except Exception as e:
-        logger.warning(f"general_chat LLM call failed: {e}. Using fallback response.")
+    # Free-text response: no schema, but still bounded retries + fallback.
+    fallback_text = "I'm here to help you plan your day and stay productive! Try saying 'schedule my day' to get started."
+    response_text = await atext(
+        chat_prompt, user_id=user_id, fallback=fallback_text, tier=PLANNER, label="chat"
+    )
+    if response_text == fallback_text:
+        logger.warning("general_chat LLM call failed or was bypassed; using fallback response.")
         
     return {
         "messages": [{"role": "assistant", "content": response_text}]
@@ -1460,7 +1408,7 @@ async def save_user_info_node(state: AgentState, store: BaseStore, config: Runna
     elif info_type == "note":
         # Save to notes/{uid}/items
         note_body = info_data.get("body") or last_message
-        summary_data = await summarize_note_content(note_body)
+        summary_data = await summarize_note_content(note_body, user_id=user_id)
         
         note_ref = db.collection("notes").document(user_id).collection("items")
         await note_ref.add({

@@ -2,12 +2,12 @@ import React, { useState, useEffect } from "react";
 import {
   View,
   Text,
-  FlatList,
   StyleSheet,
   TouchableOpacity,
   ActivityIndicator
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { FlashList } from "@shopify/flash-list";
 import { useSchedule } from "../../hooks/useSchedule";
 import { COLORS, TYPE_COLORS } from "../../constants/colors";
 import { authService } from "../../services/firebase";
@@ -156,7 +156,7 @@ export default function ScheduleScreen() {
           <Text style={styles.loadingText}>Building your schedule...</Text>
         </View>
       ) : (
-        <FlatList
+        <FlashList
           data={schedule}
           renderItem={({ item, index }) => renderScheduleBlock(item, index)}
           keyExtractor={(item, index) => item.id || `${item.time}-${index}`}

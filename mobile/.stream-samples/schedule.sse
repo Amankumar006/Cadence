@@ -1,0 +1,12 @@
+data: {"type":"start","messageId":"msg-7ffce6675fd741c590a6465b0ede11d0"}
+
+data: {"type":"text-start","id":"txt-6ec4cf4cdac3461abfe00f9f3588cff1"}
+
+data: {"type":"text-delta","id":"txt-6ec4cf4cdac3461abfe00f9f3588cff1","delta":"By the way, Can you upload a photo of your class timetable? I'll read it automatically."}
+
+data: {"type":"text-end","id":"txt-6ec4cf4cdac3461abfe00f9f3588cff1"}
+
+data: {"type":"data-schedule","data":{"status":"proposed","schedule":[{"time":"23:00","title":"Sleep","type":"rest","duration_min":480,"notes":"Target sleep time"}]}}
+
+data: [DONE]
+

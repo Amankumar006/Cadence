@@ -16,11 +16,12 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { COLORS } from "../../constants/colors";
+import { API_URL, authHeaders } from "../../services/apiHeaders";
 import { firestoreService, authService } from "../../services/firebase";
 import { SearchIcon, AddIcon, AIIcon, CameraIcon, MicIcon, WaveformIcon } from "../../components/icons";
 import * as ImagePicker from "expo-image-picker";
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || "http://localhost:8000";
+
 
 // Conditionally import expo-av (may not be installed yet)
 let Audio: any = null;
@@ -182,7 +183,7 @@ export default function NotesScreen() {
     try {
       const response = await fetch(`${API_URL}/api/notes/summarize`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ note_content: body.trim(), user_id: uid }),
       });
       if (response.ok) {
@@ -272,6 +273,7 @@ export default function NotesScreen() {
 
       const response = await fetch(`${API_URL}/api/upload/photo-note`, {
         method: "POST",
+        headers: await authHeaders(),
         body: formData,
       });
 
@@ -403,6 +405,7 @@ export default function NotesScreen() {
 
       const response = await fetch(`${API_URL}/api/upload/audio-note`, {
         method: "POST",
+        headers: await authHeaders(),
         body: formData,
       });
 

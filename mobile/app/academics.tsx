@@ -18,8 +18,7 @@ import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import { COLORS } from "../constants/colors";
 import { firestoreService, authService } from "../services/firebase";
-
-const API_URL = process.env.EXPO_PUBLIC_API_URL || "http://localhost:8000";
+import { API_URL, authHeaders } from "../services/apiHeaders";
 
 type AcademicEvent = {
   id?: string;
@@ -198,10 +197,10 @@ export default function AcademicsScreen() {
 
       const response = await fetch(`${API_URL}/api/upload/timetable`, {
         method: "POST",
-        headers: {
+        headers: await authHeaders({
           "Accept": "application/json",
           "Content-Type": "multipart/form-data",
-        },
+        }),
         body: formData
       });
 
@@ -311,10 +310,10 @@ export default function AcademicsScreen() {
 
       const response = await fetch(`${API_URL}/api/upload/syllabus`, {
         method: "POST",
-        headers: {
+        headers: await authHeaders({
           "Accept": "application/json",
           "Content-Type": "multipart/form-data",
-        },
+        }),
         body: formData
       });
 
@@ -344,7 +343,7 @@ export default function AcademicsScreen() {
 
       const response = await fetch(`${API_URL}/api/upload/confirm/timetable`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ user_id: uid, timetable: cleanedTimetable })
       });
 
@@ -370,7 +369,7 @@ export default function AcademicsScreen() {
 
       const response = await fetch(`${API_URL}/api/upload/confirm/syllabus`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: await authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           user_id: uid,
           subject: parsed.subject,

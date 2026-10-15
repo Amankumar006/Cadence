@@ -1,6 +1,7 @@
 import * as Location from "expo-location";
 import * as TaskManager from "expo-task-manager";
 import { authService } from "../services/firebase";
+import { API_URL, authHeaders } from "../services/apiHeaders";
 
 export const GEOFENCE_TASK_NAME = "GEOFENCE_BACKGROUND_TASK";
 
@@ -11,8 +12,7 @@ async function triggerLocationArrival(regionName: string) {
       console.warn("No user logged in, cannot trigger location arrival");
       return;
     }
-    const token = await authService.getIdToken().catch(() => "mock-dev-token");
-    const apiUrl = process.env.EXPO_PUBLIC_API_URL || "http://192.168.68.103:8000";
+    const apiUrl = API_URL;
     
     // Map identifier to the exact phrase the backend expects
     let messageText = `I just arrived at the ${regionName}`;
@@ -28,10 +28,7 @@ async function triggerLocationArrival(regionName: string) {
 
     const response = await fetch(`${apiUrl}/api/chat`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
+      headers: await authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         user_id: user.uid,
         thread_id: "default-chat-thread",

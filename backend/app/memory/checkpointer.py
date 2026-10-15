@@ -50,7 +50,6 @@ async for event in graph.astream(None, config, stream_mode="messages"):
 """
 
 import logging
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 logger = logging.getLogger("app.memory.checkpointer")
 

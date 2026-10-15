@@ -3,82 +3,100 @@ import asyncio
 import datetime
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict
 from langgraph.store.base import BaseStore
 from langchain_core.runnables import RunnableConfig
-from app.agents.llm import llm
-from app.config import settings
+from app.agents.llm import atext, astructured, bypass_llm
+from app.agents.schemas import (
+    IntentClassification,
+    NoteSummary,
+    ScheduleProposal,
+)
 from app.agents.state import AgentState
-from app.memory.store import load_user_profile, save_user_profile, sync_and_load_user_profile
+from app.memory.store import save_user_profile, sync_and_load_user_profile
 from app.tools.memory import store_preference_func
 from app.tools.timetable import fetch_timetable_func
 from app.tools.calendar import write_calendar_func
 from app.tools.notifications import schedule_push_func, send_immediate_push
 from app.tools.tmdb import search_movies_func
 from app.agents.discovery import identify_missing_slots
-from app.agents.parser import parse_user_info
+from app.agents.parser import parse_due_date, parse_user_info
 from firebase_admin import firestore_async
 
 logger = logging.getLogger("app.agents.nodes")
 
-async def summarize_note_content(body: str) -> dict:
-    """Uses LLM to summarize note content and extract subject + tags."""
-    logger.info(f"Summarizing note content: {body[:60]}...")
-    prompt = f"""Extract a 1-sentence summary, relevant subject, and 2-4 tags from this note.
-Note content: {body}
+async def summarize_note_content(body: str, user_id: str = None) -> dict:
+    """Uses the LLM to summarize note content and extract subject + tags.
 
-Return JSON only:
-{{
-  "summary": "1-sentence summary...",
-  "subject": "subject name or general category",
-  "tags": ["tag1", "tag2", ...]
-}}"""
-    try:
-        res = await llm.ainvoke(prompt)
-        text = res.content.strip()
-        if text.startswith("```"):
-            match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-            if match:
-                text = match.group(1).strip()
-        data = json.loads(text)
-        logger.info(f"Note summarized successfully: {data}")
-        return data
-    except Exception as e:
-        logger.error(f"Error in summarize_note_content LLM: {e}")
-        return {
-            "summary": body[:60] + "..." if len(body) > 60 else body,
-            "subject": "General",
-            "tags": ["general"]
-        }
+    Schema-constrained: the model cannot return malformed JSON, and the
+    fallback is deterministic. Never raises.
+    """
+    logger.info("Summarizing note content: %s...", (body or "")[:60])
+    prompt = f"""Extract a 1-sentence summary, the relevant subject, and 2-4 tags from this note.
+Note content: {body}"""
+    fallback = NoteSummary(
+        summary=(body[:60] + "...") if len(body) > 60 else body,
+        subject="General",
+        tags=["general"],
+    )
+    result = await astructured(prompt, NoteSummary, user_id=user_id, fallback=fallback)
+    logger.info("Note summarized: subject=%s tags=%s", result.subject, result.tags)
+    return {"summary": result.summary, "subject": result.subject, "tags": result.tags}
+
 
 def parse_date_from_message(message: str) -> str:
-    msg = message.lower()
-    today = datetime.date.today()
-    
-    # Try to extract date matching YYYY-MM-DD
-    match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", message)
-    if match:
-        return match.group(1)
-        
-    if "today" in msg:
-        return today.isoformat()
-    if "tomorrow" in msg:
-        return (today + datetime.timedelta(days=1)).isoformat()
-    if "yesterday" in msg:
-        return (today - datetime.timedelta(days=1)).isoformat()
-        
-    days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    for i, d in enumerate(days):
-        if d in msg:
-            # Find the next occurrence of this weekday
-            current_weekday = today.weekday()  # Monday is 0, Sunday is 6
-            target_weekday = i
-            days_ahead = target_weekday - current_weekday
-            if days_ahead <= 0: # target day already happened this week or is today
-                days_ahead += 7
-            return (today + datetime.timedelta(days=days_ahead)).isoformat()
-            
-    return today.isoformat() # Fallback to today
+    """Resolve a date mentioned in a message, defaulting to today.
+
+    Delegates to :func:`app.agents.parser.parse_due_date` so there is exactly
+    one date parser in the codebase.
+    """
+    parsed = parse_due_date(message)
+    return parsed or datetime.date.today().isoformat()
+
+
+def _classify_heuristically(message: str) -> tuple:
+    """Regex intent classification used for test users and LLM failure."""
+    last_msg_lower = (message or "").lower().strip()
+
+    # A question about existing data is a retrieval query, not new info.
+    is_query_for_info = any(
+        q in last_msg_lower
+        for q in [
+            "what", "when", "show", "give", "list", "check", "tell me",
+            "my monday", "my tuesday", "my wednesday", "my thursday",
+            "my friday", "my saturday", "my sunday", "my class", "my timetable",
+            "get my",
+        ]
+    )
+
+    if "arrived at" in last_msg_lower and any(
+        loc in last_msg_lower for loc in ["gym", "college", "library", "home"]
+    ):
+        return "location_trigger", "day"
+    if any(
+        kw in last_msg_lower
+        for kw in ["movie", "recommend", "watch", "film", "suggest", "binge", "entertainment"]
+    ):
+        return "entertainment_rec", "day"
+    if re.search(r"\b(edit|change|move|remove|add)\b", last_msg_lower):
+        return "schedule_edit", "day"
+    if not is_query_for_info and (
+        any(
+            kw in last_msg_lower
+            for kw in [
+                "cie", "exam", "assignment", "viva", "meditate", "workout", "unit",
+                "timetable", "time table", "schedule info", "study", "rvce", "bmsce",
+                "msrit", "bti", "vtu", "semester", "sem", "scheme", "buy", "task",
+                "todo", "reminder", "weightage", "note", "lab manual", "syllabus",
+                "class at", "routine", "deadline", "due",
+            ]
+        )
+        or last_msg_lower in ["no", "none", "nothing", "not yet", "no i don't", "no, thanks", "no thanks"]
+    ):
+        return "info_provided", "day"
+    if "schedule" in last_msg_lower or "today" in last_msg_lower:
+        return "schedule_build", "day"
+    return "general", "day"
 
 async def classify_intent(state: AgentState, store: BaseStore) -> Dict[str, Any]:
     """Classifies the user message into intent, scope, and date."""
@@ -115,64 +133,33 @@ Classify the user's latest message into one of these intents:
 
 User Message: "{last_message}"
 
-Respond with ONLY a JSON object:
-{{
-  "intent": "schedule_build|schedule_edit|entertainment_rec|location_trigger|info_provided|general",
-  "scope": "day|week",
-  "date": "YYYY-MM-DD"
-}}
-Do not output any markdown code blocks, just raw JSON. If date cannot be parsed, use today's date: {datetime.date.today().isoformat()}"""
+Respond with the intent, the scope ("day" or "week"), and the date the message refers to.
+Resolve relative dates ("today", "tomorrow", "next Monday", "20 Oct") to an absolute
+YYYY-MM-DD date using today's date: {datetime.date.today().isoformat()}.
+If no date is mentioned or implied, leave the date empty."""
 
     intent = "general"
     intent_scope = "day"
     intent_date = datetime.date.today().isoformat()
-    
-    if user_id.startswith("test_"):
-        logger.info(f"Bypassing LLM classification for test user: {user_id}")
-        last_msg_lower = last_message.lower().strip()
-        is_query_for_info = any(q in last_msg_lower for q in ["what", "when", "show", "give", "list", "check", "my monday", "my tuesday", "my wednesday", "my thursday", "my friday", "my saturday", "my sunday", "my class", "my timetable", "get my", "tell me"])
-        
-        if "arrived at" in last_msg_lower and any(loc in last_msg_lower for loc in ["gym", "college", "library", "home"]):
-            intent = "location_trigger"
-        elif any(kw in last_msg_lower for kw in ["movie", "recommend", "watch", "film", "suggest", "binge", "entertainment"]):
-            intent = "entertainment_rec"
-        elif re.search(r"\b(edit|change|move|remove|add)\b", last_msg_lower):
-            intent = "schedule_edit"
-        elif not is_query_for_info and (any(kw in last_msg_lower for kw in ["cie", "exam", "assignment", "viva", "meditate", "workout", "unit", "timetable", "time table", "schedule info", "study", "rvce", "bmsce", "msrit", "bti", "vtu", "semester", "sem", "scheme", "buy", "task", "todo", "reminder", "weightage", "note", "lab manual"]) or last_msg_lower in ["no", "none", "nothing", "not yet", "no i don't", "no, thanks", "no thanks", "no"]):
-            intent = "info_provided"
-        elif "schedule" in last_msg_lower or "today" in last_msg_lower:
-            intent = "schedule_build"
+
+    if bypass_llm(user_id):
+        logger.info("Bypassing LLM classification for user: %s", user_id)
+        intent, intent_scope = _classify_heuristically(last_message)
         intent_date = parse_date_from_message(last_message)
     else:
-        try:
-            resp = await llm.ainvoke(classify_prompt)
-            text = resp.content.strip()
-            if text.startswith("```"):
-                match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-                if match:
-                    text = match.group(1).strip()
-            parsed = json.loads(text)
-            intent = parsed.get("intent", "general")
-            intent_scope = parsed.get("scope", "day")
-            intent_date = parsed.get("date") or parse_date_from_message(last_message)
-        except Exception as e:
-            logger.warning(f"Failed LLM classification, falling back to heuristics: {e}")
-            last_msg_lower = last_message.lower().strip()
-            is_query_for_info = any(q in last_msg_lower for q in ["what", "when", "show", "give", "list", "check", "my monday", "my tuesday", "my wednesday", "my thursday", "my friday", "my saturday", "my sunday", "my class", "my timetable", "get my", "tell me"])
-            
-            if "arrived at" in last_msg_lower and any(loc in last_msg_lower for loc in ["gym", "college", "library", "home"]):
-                intent = "location_trigger"
-            elif any(kw in last_msg_lower for kw in ["movie", "recommend", "watch", "film", "suggest", "binge", "entertainment"]):
-                intent = "entertainment_rec"
-            elif re.search(r"\b(edit|change|move|remove|add)\b", last_msg_lower):
-                intent = "schedule_edit"
-            elif not is_query_for_info and (any(kw in last_msg_lower for kw in ["cie", "exam", "assignment", "viva", "meditate", "workout", "unit", "timetable", "time table", "schedule info", "study", "rvce", "bmsce", "msrit", "bti", "vtu", "semester", "sem", "scheme", "buy", "task", "todo", "reminder", "weightage", "note", "lab manual"]) or last_msg_lower in ["no", "none", "nothing", "not yet", "no i don't", "no, thanks", "no thanks", "no"]):
-                intent = "info_provided"
-            elif "schedule" in last_msg_lower or "today" in last_msg_lower:
-                intent = "schedule_build"
+        parsed = await astructured(
+            classify_prompt, IntentClassification, user_id=user_id
+        )
+        if parsed is None:
+            logger.warning("Classification failed; using heuristic fallback")
+            intent, intent_scope = _classify_heuristically(last_message)
             intent_date = parse_date_from_message(last_message)
-        
-    logger.info(f"Classified intent: {intent}, date: {intent_date}")
+        else:
+            intent = parsed.intent
+            intent_scope = parsed.scope
+            intent_date = parsed.date or parse_date_from_message(last_message)
+
+    logger.info("Classified intent: %s, scope: %s, date: %s", intent, intent_scope, intent_date)
     return {
         "intent": intent,
         "intent_scope": intent_scope,
@@ -358,7 +345,7 @@ async def save_parsed_info(user_id: str, parsed: dict, store: BaseStore) -> str:
         
     elif info_type == "note":
         note_body = info_data.get("body") or parsed.get("message", "")
-        summary_data = await summarize_note_content(note_body)
+        summary_data = await summarize_note_content(note_body, user_id=user_id)
         note_ref = db.collection("notes").document(user_id).collection("items")
         await note_ref.add({
             "title": info_data.get("title") or summary_data.get("subject") or "Note",
@@ -412,18 +399,13 @@ async def hydrate_context(state: AgentState, store: BaseStore) -> Dict[str, Any]
     user_profile = await sync_and_load_user_profile(store, user_id)
     
     messages = state.get("messages", [])
-    last_user_msg = ""
-    last_assistant_msg = ""
-    
-    if len(messages) >= 1:
-        last_user_msg = messages[-1].content if hasattr(messages[-1], "content") else (messages[-1].get("content", "") if isinstance(messages[-1], dict) else "")
-    if len(messages) >= 2:
-        for m in reversed(messages[:-1]):
-            role = getattr(m, "type", "human")
-            content = m.content if hasattr(m, "content") else (m.get("content", "") if isinstance(m, dict) else "")
-            if role == "ai" or role == "assistant" or (isinstance(m, dict) and m.get("role") == "assistant"):
-                last_assistant_msg = content
-                break
+    last_user_msg = (
+        messages[-1].content
+        if hasattr(messages[-1], "content")
+        else (messages[-1].get("content", "") if isinstance(messages[-1], dict) else "")
+        if messages
+        else ""
+    )
 
     # If the last message provided information, parse it
     if last_user_msg:
@@ -1037,25 +1019,27 @@ RULES
    - Assignment due tomorrow → You MUST add a 1.5hr (90 min) study block today to complete it, and mark the notes or title as "Urgent".
    - SEE within 14 days → You MUST restructure the entire day's schedule to focus heavily on revision.
  
-Return ONLY a JSON array. No markdown, no explanation:
-[
-  {{
-    "time": "HH:MM",
-    "title": "Block title",
-    "type": "work|study|personal|health|rest|ent",
-    "duration_min": 60,
-    "notes": "Context or reminder text shown to user"
-  }}
-]
+Return ONLY a JSON object of this exact shape:
+{{
+  "blocks": [
+    {{
+      "time": "HH:MM",
+      "title": "Block title",
+      "type": "work|study|personal|health|rest|ent",
+      "duration_min": 60,
+      "notes": "Context or reminder text shown to user"
+    }}
+  ]
+}}
 """
 
-    logger.info(f"Generated schedule prompt for date: {date}")
-    
+    logger.info("Generated schedule prompt for date: %s", date)
+
     proposed_schedule = None
-    
+
     # 1. Bypass LLM for test users to avoid API rate limit depletion during automated runs
-    if user_id.startswith("test_"):
-        logger.info(f"Bypassing LLM call for test user: {user_id}")
+    if bypass_llm(user_id):
+        logger.info("Bypassing LLM call for test user: %s", user_id)
         proposed_schedule = generate_rule_based_schedule(
             user_id=user_id,
             date=date,
@@ -1070,19 +1054,14 @@ Return ONLY a JSON array. No markdown, no explanation:
             recent_notes=recent_notes
         )
     else:
-        # Call the LLM fallback chain
-        response_content = ""
-        last_err = None
-        try:
-            logger.info("Calling LLM fallback chain...")
-            resp = await llm.ainvoke(prompt)
-            response_content = resp.content
-        except Exception as e:
-            logger.error(f"Error calling LLM fallback chain: {e}")
-            last_err = e
-            
-        if not response_content:
-            logger.error(f"All LLM models failed. Building rule-based fallback. Last error: {last_err}")
+        # Schema-constrained call: the model cannot emit malformed JSON, and
+        # every block is validated (time/title/duration/type) before use.
+        proposal = await astructured(prompt, ScheduleProposal, user_id=user_id)
+
+        if proposal is None or not proposal.blocks:
+            logger.error(
+                "All LLM models failed or returned no blocks. Building rule-based fallback."
+            )
             proposed_schedule = generate_rule_based_schedule(
                 user_id=user_id,
                 date=date,
@@ -1097,38 +1076,11 @@ Return ONLY a JSON array. No markdown, no explanation:
                 recent_notes=recent_notes
             )
         else:
-            # Normalise response_content: gemini-flash-latest returns a list of content parts
-            if isinstance(response_content, list):
-                response_content = " ".join(
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in response_content
-                ).strip()
-                
-            # Parse the JSON response
-            try:
-                text = response_content.strip()
-                if text.startswith("```"):
-                    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-                    if match:
-                        text = match.group(1).strip()
-                proposed_schedule = json.loads(text)
-                logger.info(f"Successfully parsed proposed schedule with {len(proposed_schedule)} blocks.")
-            except Exception as parse_err:
-                logger.error(f"Failed to parse JSON schedule response: {parse_err}. Content: {response_content[:200]}")
-                proposed_schedule = generate_rule_based_schedule(
-                    user_id=user_id,
-                    date=date,
-                    weekday_name=weekday_name,
-                    is_weekend=is_weekend,
-                    classes=classes,
-                    personal_fixed_blocks=personal_fixed_blocks,
-                    academic_events=academic_events,
-                    academic_calendar=academic_calendar,
-                    user_profile=user_profile,
-                    pending_tasks=pending_tasks,
-                    recent_notes=recent_notes
-                )
-            
+            proposed_schedule = [block.model_dump() for block in proposal.blocks]
+            logger.info(
+                "Successfully parsed proposed schedule with %d blocks.", len(proposed_schedule)
+            )
+
     return {
         "proposed_schedule": proposed_schedule,
         "needs_clarification": False
@@ -1255,23 +1207,11 @@ Conversation so far:
 
 Respond to the latest user message. If the user is asking about their classes, timetable, exams, or tasks, use the provided context to answer accurately. If they haven't uploaded a timetable/syllabus but are asking about it, guide them on how to upload a photo/document in the Academics tab."""
     
-    # Try calling LLM for chat response
-    response_text = "I'm here to help you plan your day and stay productive! Try saying 'schedule my day' to get started."
-    try:
-        if user_id.startswith("test_"):
-            raise ValueError("Bypassing LLM call for test user.")
-        resp = await llm.ainvoke(chat_prompt)
-        raw = resp.content
-        if isinstance(raw, list):
-            # Extract text from list of content parts
-            response_text = " ".join(
-                part.get("text", "") if isinstance(part, dict) else str(part)
-                for part in raw
-            ).strip()
-        elif isinstance(raw, str):
-            response_text = raw.strip()
-    except Exception as e:
-        logger.warning(f"general_chat LLM call failed: {e}. Using fallback response.")
+    # Free-text response: no schema, but still bounded retries + fallback.
+    fallback_text = "I'm here to help you plan your day and stay productive! Try saying 'schedule my day' to get started."
+    response_text = await atext(chat_prompt, user_id=user_id, fallback=fallback_text)
+    if response_text == fallback_text:
+        logger.warning("general_chat LLM call failed or was bypassed; using fallback response.")
         
     return {
         "messages": [{"role": "assistant", "content": response_text}]
@@ -1460,7 +1400,7 @@ async def save_user_info_node(state: AgentState, store: BaseStore, config: Runna
     elif info_type == "note":
         # Save to notes/{uid}/items
         note_body = info_data.get("body") or last_message
-        summary_data = await summarize_note_content(note_body)
+        summary_data = await summarize_note_content(note_body, user_id=user_id)
         
         note_ref = db.collection("notes").document(user_id).collection("items")
         await note_ref.add({

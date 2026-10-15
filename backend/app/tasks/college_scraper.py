@@ -1,11 +1,15 @@
 import logging
-import json
 import re
 import base64
 import httpx
 import asyncio
 from typing import Optional
-from app.agents.llm import llm
+from app.agents.llm import astructured
+from app.agents.schemas import (
+    AcademicCalendar,
+    CollegeMatch,
+    SyllabusExtraction,
+)
 from app.data.colleges import COLLEGE_DATABASE
 from app.config import settings
 from firebase_admin import firestore_async
@@ -90,29 +94,17 @@ async def fetch_vtu_syllabus(branch: str, scheme: str, semester: int) -> dict:
 This PDF is the official VTU {scheme} Scheme syllabus for {branch_upper} branch.
 Extract ALL subjects for SEMESTER {semester} ONLY.
 
-For each subject, return:
-{{
-  "subject_code": string (e.g. "21CS51"),
-  "subject": string (full subject name),
-  "credits": number,
-  "units": [
-    {{
-      "number": number (1-5),
-      "title": string,
-      "topics": [string],
-      "status": "not_started",
-      "completion_percent": 0
-    }}
-  ],
-  "cie_marks": number (usually 50),
-  "see_marks": number (usually 50 or 100),
-  "see_duration": string (e.g. "3 hours"),
-  "type": "theory" | "lab" | "project"
-}}
+For each subject, extract:
+- subject_code (e.g. "21CS51")
+- subject (full subject name)
+- credits
+- units: for each unit, the number (1-5), title, topics list, and
+  status "not_started" with completion_percent 0
+- cie_marks (usually 50), see_marks (usually 50 or 100), see_duration (e.g. "3 hours")
+- type: "theory" | "lab" | "project"
 
-Return a JSON array of all subjects found for semester {semester}.
-If no subjects are found for that semester, return an empty array [].
-Do not output any markdown code blocks, just raw JSON array."""
+Return an object with a "subjects" array containing every subject found for
+semester {semester}. If none are found, return an empty subjects array."""
 
     try:
         text = await _call_gemini_with_pdf(prompt, pdf_bytes)
@@ -121,13 +113,14 @@ Do not output any markdown code blocks, just raw JSON array."""
             match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
             if match:
                 text = match.group(1).strip()
-        subjects = json.loads(text)
-        if not isinstance(subjects, list):
-            subjects = [subjects]
-        logger.info(f"Parsed {len(subjects)} subjects for sem {semester} {branch_upper} ({scheme} scheme)")
+        # Validate against the schema so a hallucinated field name or wrong
+        # type is caught here rather than surfacing as a broken schedule later.
+        extraction = SyllabusExtraction.model_validate_json(text)
+        subjects = [s.model_dump() for s in extraction.subjects]
+        logger.info("Parsed %d subjects for sem %s %s (%s scheme)", len(subjects), semester, branch_upper, scheme)
         return {"status": "found", "data": subjects}
     except Exception as e:
-        logger.error(f"Failed to parse VTU syllabus PDF with Gemini: {e}", exc_info=True)
+        logger.error("Failed to parse VTU syllabus PDF with Gemini: %s", e, exc_info=True)
         return {"status": "parse_error", "data": []}
 
 
@@ -242,29 +235,23 @@ async def fetch_syllabus_for_student_task(user_id: str, branch: str, scheme: str
 
 async def find_college(user_input: str) -> Optional[str]:
     """Uses Gemini to match the user's input to a COLLEGE_DATABASE key.
-    
+
     Returns college_key (e.g. 'rvce', 'bmsce', 'msrit', 'vtu') or None.
+    Schema-constrained: the model can only return a single string, and the
+    validator normalises "None"/quotes/case for us.
     """
     prompt = f"""You are a college matching helper.
 Match the user's input: "{user_input}"
 to one of the keys in this database:
-{list(COLLEGE_DATABASE.keys())} (i.e. 'rvce', 'bmsce', 'msrit', 'vtu')
+{list(COLLEGE_DATABASE.keys())} (i.e. 'rvce', 'bmsce', 'msrit', 'bti', 'vtu')
 
-Return ONLY the matching key string. If there is no match or it is unclear, return the string "None". Do not output any other text or markdown."""
-    
-    try:
-        resp = await llm.ainvoke(prompt)
-        key = resp.content.strip().lower()
-        if key.startswith("```"):
-            match = re.search(r"```(?:json)?\s*(.*?)\s*```", key, re.DOTALL)
-            if match:
-                key = match.group(1).strip()
-        key = key.replace("'", "").replace('"', "")
-        if key in COLLEGE_DATABASE:
-            return key
-    except Exception as e:
-        logger.warning(f"Failed to match college using Gemini: {e}")
-    return None
+Return the matching key. If there is no match or it is unclear, return an empty string."""
+    match = await astructured(prompt, CollegeMatch)
+    key = match.college_key if match else ""
+    if key not in COLLEGE_DATABASE:
+        logger.info("College '%s' did not match a known key (got '%s')", user_input, key)
+        return None
+    return key
 
 async def fetch_vtu_syllabus_url(branch: str, semester: int, scheme: str) -> str:
     """Constructs the direct VTU PDF URL for the syllabus."""
@@ -298,38 +285,20 @@ def clean_html(html: str) -> str:
 
 async def run_gemini_fallback(college_key: str, college: dict) -> dict:
     """Fallback using Gemini's knowledge/grounding to estimate or retrieve the academic calendar."""
-    logger.info(f"Running Gemini fallback for college '{college_key}'...")
+    logger.info("Running Gemini fallback for college '%s'...", college_key)
     prompt = f"""You are an expert academic calendar assistant.
 The official website for {college.get("name")} ({college_key}) could not be scraped directly.
 Please provide the estimated or actual academic calendar dates for the current academic year 2025-26 for this college.
 If you do not know the exact dates, use typical dates for VTU-affiliated colleges in Karnataka (typically, the odd semester starts around August/September and ends in December/January; even semester starts around February/March and ends in June/July).
 
-Return JSON only:
-{{
-  "semester_start": "2025-08-01",
-  "semester_end": "2026-06-30",
-  "cie_dates": [
-    {{ "name": "CIE 1", "start_date": "2025-09-15", "end_date": "2025-09-18" }},
-    {{ "name": "CIE 2", "start_date": "2025-11-10", "end_date": "2025-11-13" }}
-  ],
-  "see_start": "2025-12-15",
-  "see_end": "2026-01-10",
-  "holidays": []
-}}
-Return ONLY valid JSON. Make sure dates are realistic for 2025-26. Do not output any markdown code blocks, just raw JSON."""
-    try:
-        resp = await llm.ainvoke(prompt)
-        text = resp.content.strip()
-        if text.startswith("```"):
-            match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-            if match:
-                text = match.group(1).strip()
-        data = json.loads(text)
-        if data.get("semester_start") and data.get("semester_end"):
-            return {"status": "scraped", "data": data}
-    except Exception as e:
-        logger.warning(f"Gemini fallback failed: {e}")
-    return {"status": "manual", "data": {}}
+Return dates in YYYY-MM-DD format. If a date is unknown, leave the field empty."""
+    calendar = await astructured(prompt, AcademicCalendar)
+    if calendar is None:
+        return {"status": "manual", "data": {}}
+    if calendar.is_empty:
+        logger.warning("Gemini fallback returned an empty calendar for '%s'", college_key)
+        return {"status": "manual", "data": {}}
+    return {"status": "scraped", "data": calendar.model_dump()}
 
 async def scrape_college_calendar(college_key: str) -> dict:
     """Fetches the college or VTU calendar page using httpx and extracts dates via Gemini."""
@@ -372,41 +341,29 @@ Analyze this scraped webpage text from {url} for college '{college.get("name")}'
 Webpage Text:
 {cleaned_text}
 
-Extract academic dates for the 2025-26 academic year.
-Return JSON only:
-{{
-  "semester_start": "YYYY-MM-DD" or null,
-  "semester_end": "YYYY-MM-DD" or null,
-  "cie_dates": [
-    {{ "name": string, "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD" }}
-  ],
-  "see_start": "YYYY-MM-DD" or null,
-  "see_end": "YYYY-MM-DD" or null,
-  "holidays": [
-    {{ "date": "YYYY-MM-DD", "name": string }}
-  ]
-}}
-If a date is not found, return null for that field.
-Only extract dates for the current academic year 2025-26.
-Do not output any markdown code blocks, just raw JSON."""
+Extract academic dates for the 2025-26 academic year:
+- semester_start and semester_end (YYYY-MM-DD)
+- cie_dates: each internal assessment with its name, start_date and end_date
+- see_start and see_end (YYYY-MM-DD)
+- holidays: each with a date and name
+
+If a date is not on the page, leave that field empty rather than guessing.
+Only extract dates for the current academic year 2025-26."""
 
     try:
-        resp = await llm.ainvoke(prompt)
-        text = resp.content.strip()
-        if text.startswith("```"):
-            match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-            if match:
-                text = match.group(1).strip()
-        data = json.loads(text)
-        
-        # Check if we got mostly nulls
+        calendar = await astructured(prompt, AcademicCalendar)
+        if calendar is None:
+            raise ValueError("LLM returned no calendar")
+        data = calendar.model_dump()
+
+        # Check if we got mostly empty fields
         if not data.get("semester_start") and not data.get("semester_end") and not data.get("cie_dates"):
-            logger.info("Scraping returned mostly nulls. Trying Gemini fallback...")
+            logger.info("Scraping returned mostly empty fields. Trying Gemini fallback...")
             return await run_gemini_fallback(college_key, college)
-            
+
         return {"status": "scraped", "data": data}
     except Exception as e:
-        logger.warning(f"Failed to parse scraped calendar with Gemini: {e}")
+        logger.warning("Failed to parse scraped calendar with Gemini: %s", e)
         return await run_gemini_fallback(college_key, college)
 
 async def run_college_calendar_scraper_task(user_id: str, college_name: str):

@@ -7,7 +7,6 @@ Expo's push service and marks it as sent in Firestore.
 
 import logging
 import datetime
-import asyncio
 from typing import List, Dict, Any
 
 import httpx

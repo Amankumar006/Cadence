@@ -85,16 +85,21 @@ The repository is divided into a Python backend service and a TypeScript Expo mo
 │   │   ├── agents/             # LangGraph state nodes, router, and chat stream controllers
 │   │   │   ├── discovery.py    # Onboarding gap identifier
 │   │   │   ├── graph.py        # LangGraph StateGraph builder
+│   │   │   ├── llm.py          # Schema-constrained LLM entry points (astructured / atext)
 │   │   │   ├── nodes.py        # Graph computation nodes (Build, Commit, Hydrate)
 │   │   │   ├── parser.py       # Entity & info parser (LLM + regex heuristic fallback)
+│   │   │   ├── schemas.py      # Pydantic models for every structured LLM output
 │   │   │   └── state.py        # AgentState TypedDict definitions
 │   │   ├── api/                # FastAPI routing paths (auth, chat streams, image uploads)
 │   │   ├── data/               # Local JSON mappings & college catalogs
 │   │   ├── memory/             # Postgres memory savers & checkpointer configurations
-│   │   ├── tasks/              # Celery/APScheduler background jobs (Nightly Learning, Scrapers)
+│   │   ├── tasks/              # APScheduler background jobs (Nightly Learning, Scrapers)
 │   │   ├── tools/              # Specialized agent actions (Syllabus downloader, TMDB movie locator)
 │   │   └── main.py             # FastAPI App root configuration
+│   ├── tests/                  # pytest suite (in-memory Firestore/LLM fakes, no credentials needed)
 │   ├── requirements.txt        # Backend python dependencies
+│   ├── requirements-dev.txt    # pytest + pytest-asyncio
+│   ├── .env.example            # Copy to .env and fill in
 │   └── firebase-service-account.json [EXCLUDED] # Credentials
 ├── mobile/
 │   ├── app/                    # Expo Router structure (Tabs: Schedule, Profile, Academics)
@@ -126,6 +131,13 @@ The system stores configuration files, user profile information, and schedule lo
 
 ## 🔌 REST API References
 
+> [!NOTE]
+> Every endpoint requires `Authorization: Bearer <firebase-id-token>`. The uid in
+> the token is authoritative; a `user_id` in the request body that disagrees with
+> it is rejected with `403`. When Firebase credentials are absent (local dev),
+> the backend runs in a documented fallback that accepts the body `user_id` so
+> the Expo mock-auth demo keeps working — see `backend/app/api/auth.py`.
+
 ### 1. Unified Agent Stream
 - **Path**: `POST /api/chat`
 - **Content-Type**: `application/json`
@@ -138,6 +150,8 @@ The system stores configuration files, user profile information, and schedule lo
   }
   ```
 - **Returns**: `text/event-stream` returning text tokens, intermediate tool outputs, or interrupted proposed schedules.
+- **Thread namespacing**: the thread is stored as `{user_id}:{thread_id}`, so two
+  users sending the same constant `thread_id` never share state.
 
 ### 2. Timetable Image Extraction
 - **Path**: `POST /api/upload/timetable`
@@ -184,6 +198,12 @@ pip install -r requirements.txt
 
 # Create .env file and edit configuration keys
 cp .env.example .env
+```
+
+Run the test suite (no Postgres, Firebase, or API keys required):
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 Start the local server:
 ```bash

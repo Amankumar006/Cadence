@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { authService } from "../services/firebase";
+import { API_URL, authHeaders } from "../services/apiHeaders";
 
 export interface ChatMessage {
   id: string;
@@ -37,7 +38,7 @@ export function useAgentChat(threadId: string) {
     return unsubAuth;
   }, []);
 
-  const apiUrl = process.env.EXPO_PUBLIC_API_URL || "http://localhost:8000";
+  const apiUrl = API_URL;
 
   useEffect(() => {
     const checkConnection = async () => {
@@ -58,10 +59,6 @@ export function useAgentChat(threadId: string) {
   }, [apiUrl]);
 
 
-  const authHeaders = (): Record<string, string> => ({
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${token || "mock-dev-token"}`,
-  });
 
   const nextId = (prefix: string) => `${prefix}_${Date.now()}_${++msgIdCounter.current}`;
 
@@ -84,7 +81,7 @@ export function useAgentChat(threadId: string) {
     try {
       const response = await fetch(`${apiUrl}/api/chat`, {
         method: "POST",
-        headers: authHeaders(),
+        headers: await authHeaders(),
         body: JSON.stringify({
           user_id: userId,
           thread_id: threadId,
@@ -170,9 +167,10 @@ export function useAgentChat(threadId: string) {
       try {
         const response = await fetch(`${apiUrl}/api/schedule/approve`, {
           method: "POST",
-          headers: authHeaders(),
+          headers: await authHeaders(),
           body: JSON.stringify({
             thread_id: threadId,
+            user_id: userId,
             feedback,
           }),
         });
